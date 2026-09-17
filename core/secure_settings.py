@@ -14,6 +14,16 @@ from typing import Any, Dict, List, Optional
 from config import DEFAULT_CONFIG, PROVIDER_DEFAULTS, SECRETS_PATH, SETTINGS_PATH
 
 
+def _looks_like_api_key(value: str) -> bool:
+    value = str(value or "").strip()
+    return value.startswith(("sk-", "sk_")) and "://" not in value
+
+
+def _valid_api_url(value: str) -> bool:
+    value = str(value or "").strip().lower()
+    return value.startswith(("http://", "https://")) and "://" in value
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
 
@@ -91,6 +101,29 @@ class SettingsStore:
                         self._secrets = parsed
                 except Exception:
                     self._secrets = {}
+            if self._repair_provider_settings():
+                self.save()
+
+    def _repair_provider_settings(self) -> bool:
+        """Remove accidentally plaintext API keys from URL fields and restore provider defaults."""
+        changed = False
+        providers = list(self._settings.get("providers", []))
+        api_keys = self._secrets.setdefault("api_keys", {})
+        for profile in providers:
+            kind = str(profile.get("kind") or "custom").lower()
+            base_url = str(profile.get("base_url") or "").strip()
+            if _looks_like_api_key(base_url):
+                profile_id = str(profile.get("id") or "")
+                if profile_id and not api_keys.get(profile_id):
+                    api_keys[profile_id] = base_url
+                profile["base_url"] = PROVIDER_DEFAULTS.get(kind, {}).get("base_url", "")
+                changed = True
+            elif kind in PROVIDER_DEFAULTS and kind != "custom" and not _valid_api_url(base_url):
+                profile["base_url"] = PROVIDER_DEFAULTS[kind]["base_url"]
+                changed = True
+        if changed:
+            self._settings["providers"] = providers
+        return changed
 
     def _write_json_atomic(self, path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +184,19 @@ class SettingsStore:
                 kind = "custom"
             profile_id = str(payload.get("id") or uuid.uuid4().hex)
             default = PROVIDER_DEFAULTS[kind]
+            submitted_base_url = str(payload.get("base_url") or "").strip()
+            submitted_api_key = payload.get("api_key")
+            if _looks_like_api_key(submitted_base_url):
+                if not submitted_api_key:
+                    submitted_api_key = submitted_base_url
+                submitted_base_url = default["base_url"]
+            if submitted_base_url and not _valid_api_url(submitted_base_url):
+                raise ValueError("API 地址必须以 http:// 或 https:// 开头，不能填写 API Key")
             profile = {
                 "id": profile_id,
                 "kind": kind,
                 "name": str(payload.get("name") or default["name"]).strip(),
-                "base_url": str(payload.get("base_url") or default["base_url"]).strip().rstrip("/"),
+                "base_url": str(submitted_base_url or default["base_url"]).strip().rstrip("/"),
                 "model": str(payload.get("model") or "").strip(),
                 "timeout_seconds": max(10, min(int(payload.get("timeout_seconds", 180)), 600)),
             }
@@ -167,7 +208,7 @@ class SettingsStore:
             else:
                 providers.append(profile)
             self._settings["providers"] = providers
-            api_key = payload.get("api_key")
+            api_key = submitted_api_key
             if api_key is not None and str(api_key).strip():
                 self._secrets.setdefault("api_keys", {})[profile_id] = str(api_key).strip()
             self.save()
@@ -193,4 +234,3 @@ class SettingsStore:
                 else:
                     self._secrets.pop("proxy_password", None)
             self.save()
-

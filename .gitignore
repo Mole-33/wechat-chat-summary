@@ -9,8 +9,8 @@ dist/
 *.spec
 *.exe
 *.zip
-data/*.db
-data/*.db-*
+data/
+logs/
 reports/*
 exports/*
 .secrets/
@@ -18,4 +18,3 @@ exports/*
 *.key
 settings.json
 runtime/
-

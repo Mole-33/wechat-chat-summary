@@ -19,11 +19,13 @@ def _endpoint(base_url: str, suffix: str) -> str:
     base = base_url.strip().rstrip("/")
     if not base:
         raise APIClientError("API 地址不能为空")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise APIClientError("API 地址必须是以 http:// 或 https:// 开头的有效网址，不能填写 API Key")
     suffix = suffix.lstrip("/")
-    if base.endswith("/chat/completions") and suffix == "chat/completions":
-        return base
-    if base.endswith("/models") and suffix == "models":
-        return base
+    for known_suffix in ("/chat/completions", "/models"):
+        if base.endswith(known_suffix):
+            base = base[: -len(known_suffix)].rstrip("/")
     return f"{base}/{suffix}"
 
 
@@ -76,8 +78,19 @@ class CompatibleAIClient:
     def list_models(self) -> List[str]:
         url = _endpoint(str(self.profile.get("base_url") or ""), "models")
         payload = self._request("GET", url)
-        data = payload.get("data", []) if isinstance(payload, dict) else []
-        models = sorted({str(item.get("id")) for item in data if isinstance(item, dict) and item.get("id")})
+        if isinstance(payload, dict):
+            data = payload.get("data", payload.get("models", []))
+        elif isinstance(payload, list):
+            data = payload
+        else:
+            data = []
+        models = sorted({
+            str(item.get("id") or item.get("name"))
+            for item in data
+            if isinstance(item, dict) and (item.get("id") or item.get("name"))
+        })
+        if not models:
+            raise APIClientError("平台连接成功，但没有返回可用模型；可检查 API Key 权限或手动填写模型名称")
         return models
 
     def chat(self, system_prompt: str, user_prompt: str) -> Dict:
@@ -102,4 +115,3 @@ class CompatibleAIClient:
         except (KeyError, IndexError, TypeError):
             raise APIClientError("平台响应中缺少模型输出文本") from None
         return {"content": content or "", "usage": payload.get("usage", {})}
-
