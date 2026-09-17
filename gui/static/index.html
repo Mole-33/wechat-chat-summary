@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>微信群聊 AI 总结助手</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="glow-sphere sphere-1"></div><div class="glow-sphere sphere-2"></div>
+  <div class="app-shell">
+    <header class="app-header glass-card">
+      <div class="brand-section">
+        <div class="logo-badge">微</div>
+        <div><h1>微信群聊 AI 总结助手</h1><p>本地只读微信 4.x · 聚合统计 · 多平台 AI 总结</p></div>
+      </div>
+      <div class="header-actions">
+        <span id="wechatBadge" class="status-pill status-off"><i></i><span>未连接微信</span></span>
+        <button id="btnUpdate" class="btn btn-secondary">检查更新</button>
+        <button id="btnSettings" class="btn btn-secondary">⚙ AI 与代理设置</button>
+        <button id="btnExit" class="btn btn-danger-ghost">退出</button>
+      </div>
+    </header>
+
+    <div class="privacy-banner">
+      <span>🔒</span><div><strong>隐私边界</strong><p>微信密钥仅驻留内存；消息正文和 AI 总结不自动落盘。仅聚合统计会保存。发送云端前会显示范围与调用估算。</p></div>
+    </div>
+
+    <section class="setup-grid">
+      <article class="panel glass-card">
+        <div class="panel-header"><h2>① 连接微信账号</h2><span id="accountState" class="badge badge-gray">未连接</span></div>
+        <label>本机微信账号</label>
+        <div class="inline-controls"><select id="accountSelect" class="form-control"><option>正在检测…</option></select><button id="btnReloadAccounts" class="btn btn-secondary">刷新</button></div>
+        <button id="btnConnect" class="btn btn-primary btn-block">授权并连接本地数据库</button>
+        <p class="form-help">微信需保持登录。首次连接可能请求管理员权限；解密工作副本在退出时清除。</p>
+      </article>
+
+      <article class="panel glass-card">
+        <div class="panel-header"><h2>② 选择群聊</h2><span id="groupCount" class="badge badge-cyan">0 个</span></div>
+        <input id="groupSearch" class="form-control" placeholder="搜索群名称">
+        <div id="groupPicker" class="group-picker"><div class="empty-state compact">连接微信后显示群聊</div></div>
+        <button id="btnSaveGroups" class="btn btn-secondary btn-block">保存群聊选择</button>
+      </article>
+
+      <article class="panel glass-card">
+        <div class="panel-header"><h2>③ 实时读取</h2><span id="monitorBadge" class="badge badge-gray">已停止</span></div>
+        <p class="feature-copy">以本地数据库增量轮询替代界面抓取，减少快速连续消息遗漏。</p>
+        <button id="btnMonitor" class="btn btn-primary btn-block">▶ 启动实时读取</button>
+        <div class="mini-metrics"><div><span>本次捕获</span><strong id="liveCount">0</strong></div><div><span>读取方式</span><strong>只读</strong></div></div>
+      </article>
+    </section>
+
+    <section class="kpi-grid">
+      <div class="kpi-card glass-card"><span class="kpi-icon">💬</span><div><p>今日发言总量</p><strong id="kpiMessages">0</strong><small>条</small></div></div>
+      <div class="kpi-card glass-card"><span class="kpi-icon">👥</span><div><p>活跃发言人数</p><strong id="kpiMembers">0</strong><small>人</small></div></div>
+      <div class="kpi-card glass-card"><span class="kpi-icon">📝</span><div><p>今日累计字数</p><strong id="kpiWords">0</strong><small>字</small></div></div>
+      <div class="kpi-card glass-card"><span class="kpi-icon">⏰</span><div><p>最活跃时段</p><strong id="kpiPeak">--</strong><small id="kpiPeakCount"></small></div></div>
+    </section>
+
+    <main class="dashboard-grid">
+      <section class="dashboard-main">
+        <article class="panel glass-card summary-panel">
+          <div class="panel-header"><div><h2>✨ AI 群聊总结</h2><p>每个群分别生成，不混合上下文</p></div><span id="summaryStatus" class="badge badge-gray">等待配置</span></div>
+          <div class="summary-controls">
+            <label>开始时间<input id="summaryStart" type="datetime-local" class="form-control"></label>
+            <label>结束时间<input id="summaryEnd" type="datetime-local" class="form-control"></label>
+            <label>AI 平台<select id="summaryProvider" class="form-control"><option value="">请先配置平台</option></select></label>
+          </div>
+          <div class="action-row"><button id="btnEstimate" class="btn btn-secondary">估算消息量与调用次数</button><button id="btnRunSummary" class="btn btn-primary" disabled>确认并开始总结</button></div>
+          <div id="estimateBox" class="estimate-box hidden"></div>
+          <div id="jobProgress" class="progress-box hidden"><div><span id="progressText">处理中</span><strong id="progressPercent">0%</strong></div><div class="progress-track"><i id="progressBar"></i></div></div>
+          <div id="summaryResults" class="summary-results"><div class="empty-state"><span>✨</span><p>选择时间范围并先进行费用估算</p></div></div>
+        </article>
+
+        <article class="panel glass-card">
+          <div class="panel-header"><h2>📋 全员发言统计排行榜</h2><div class="inline-controls compact"><select id="statsGroup" class="form-control"></select><input id="statsDate" type="date" class="form-control"><button id="btnRefreshStats" class="btn btn-secondary">刷新</button></div></div>
+          <div class="table-container"><table class="leaderboard-table"><thead><tr><th>排名</th><th>群员昵称</th><th>条数</th><th>占比</th><th>累计字数</th><th>首发时间</th></tr></thead><tbody id="leaderboardBody"><tr><td colspan="6" class="empty-cell">暂无统计数据</td></tr></tbody></table></div>
+          <div id="hourlyChart" class="hourly-chart"></div>
+          <div class="action-row right"><button id="btnExcel" class="btn btn-secondary">导出当天 Excel</button><button id="btnReports" class="btn btn-secondary">打开报表目录</button></div>
+        </article>
+      </section>
+
+      <aside class="dashboard-side">
+        <article class="panel glass-card">
+          <div class="panel-header"><h2>⚡ 实时文字消息</h2><span id="liveBadge" class="badge badge-cyan">0 条</span></div>
+          <div id="liveFeed" class="live-feed"><div class="empty-state compact">启动实时读取后显示</div></div>
+        </article>
+        <article class="panel glass-card">
+          <div class="panel-header"><h2>🕘 每日自动总结</h2><label class="switch"><input id="scheduleEnabled" type="checkbox"><span></span></label></div>
+          <label>所有群共用执行时间<input id="scheduleTime" type="time" class="form-control" value="23:30"></label>
+          <label>首次回溯时间<input id="firstBackfill" type="datetime-local" class="form-control"></label>
+          <p class="form-help">首次回溯时间应用到当前所选群；之后各群从上次成功时间增量总结。仅应用运行时执行。</p>
+          <button id="btnSaveSchedule" class="btn btn-secondary btn-block">保存定时设置</button>
+        </article>
+      </aside>
+    </main>
+  </div>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" class="dialog-card glass-card">
+      <div class="panel-header"><div><h2>AI 平台与网络设置</h2><p>API Key 使用 Windows DPAPI 加密保存</p></div><button class="icon-close" value="cancel">×</button></div>
+      <div class="settings-columns">
+        <section><h3>平台配置</h3><label>已保存配置<select id="providerProfile" class="form-control"><option value="">新建配置</option></select></label><label>平台<select id="providerKind" class="form-control"></select></label><label>配置名称<input id="providerName" class="form-control"></label><label>API 地址<input id="providerBaseUrl" class="form-control"></label><label>API Key<input id="providerApiKey" type="password" class="form-control" placeholder="留空则保留已保存密钥"></label><label>模型<div class="inline-controls"><select id="providerModelList" class="form-control"><option value="">自动获取后选择</option></select><input id="providerModel" class="form-control" placeholder="或手动输入"></div></label><div class="action-row"><button id="btnFetchModels" type="button" class="btn btn-secondary">获取模型</button><button id="btnTestProvider" type="button" class="btn btn-secondary">测试连接</button><button id="btnSaveProvider" type="button" class="btn btn-primary">保存平台</button></div></section>
+        <section><h3>HTTP/HTTPS 代理</h3><label>代理地址<input id="proxyUrl" class="form-control" placeholder="例如 http://127.0.0.1:7890"></label><label>用户名（可选）<input id="proxyUsername" class="form-control"></label><label>密码（可选）<input id="proxyPassword" type="password" class="form-control" placeholder="留空则保留已保存密码"></label><button id="btnSaveProxy" type="button" class="btn btn-secondary btn-block">保存代理</button><div class="security-note">🔐 API Key 与代理密码不会返回到浏览器页面，也不会写入日志。</div></section>
+      </div>
+    </form>
+  </dialog>
+  <div id="toastContainer" class="toast-container"></div>
+  <script src="app.js"></script>
+</body>
+</html>
