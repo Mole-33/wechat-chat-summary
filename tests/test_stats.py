@@ -47,6 +47,70 @@ class TestStatsAndPrivacy(unittest.TestCase):
         self.assertGreater(estimate_tokens("中文 test"), 0)
         self.assertEqual(len(chunk_messages(messages, limit=20)), 2)
 
+    def test_same_or_unknown_names_do_not_merge_different_senders(self):
+        messages = [
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 0), "测试群", "同名", "第一条",
+                sender_id="wxid_one",
+            ),
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 1), "测试群", "同名", "第二条",
+                sender_id="wxid_two",
+            ),
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 2), "测试群", "未知成员", "第三条",
+                sender_id="101",
+            ),
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 3), "测试群", "未知成员", "第四条",
+                sender_id="102",
+            ),
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 4), "测试群", "同名", "第五条",
+                sender_id="nickname:同名",
+            ),
+            ChatMessage(
+                datetime(2026, 9, 17, 9, 5), "测试群", "同名", "第六条",
+            ),
+        ]
+        summary = self.engine.compute_daily_summary(messages, "测试群", "2026-09-17")
+        self.assertEqual(summary.total_members_spoke, 6)
+        self.assertEqual([item.message_count for item in summary.member_stats], [1, 1, 1, 1, 1, 1])
+        self.storage.replace_daily_summary("room@chatroom", summary)
+        loaded = self.storage.get_daily_summary("room@chatroom", "2026-09-17")
+        self.assertEqual(loaded.total_members_spoke, 6)
+        self.assertEqual(len(loaded.member_stats), 6)
+        self.assertEqual(len({item.member_key for item in loaded.member_stats}), 6)
+        self.assertFalse(any("wxid" in item.member_key for item in loaded.member_stats))
+
+    def test_legacy_nickname_keyed_member_stats_are_migrated(self):
+        legacy_path = Path(self.tmp.name) / "legacy.db"
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            """CREATE TABLE daily_member_stats (
+                group_id TEXT NOT NULL, date_str TEXT NOT NULL, nickname TEXT NOT NULL,
+                message_count INTEGER NOT NULL, total_words INTEGER NOT NULL,
+                first_time TEXT, last_time TEXT, rank_no INTEGER NOT NULL,
+                PRIMARY KEY (group_id, date_str, nickname)
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO daily_member_stats VALUES(?,?,?,?,?,?,?,?)",
+            ("room", "2026-09-16", "历史昵称", 3, 12, "09:00", "10:00", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        StorageManager(legacy_path)
+        conn = sqlite3.connect(legacy_path)
+        try:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(daily_member_stats)")]
+            row = conn.execute("SELECT member_key,nickname FROM daily_member_stats").fetchone()
+        finally:
+            conn.close()
+        self.assertIn("member_key", columns)
+        self.assertEqual(row, ("legacy:历史昵称", "历史昵称"))
+
     def test_markdown_contains_fixed_sections_and_evidence(self):
         data = {
             "group_name": "测试群", "start": "2026-09-17 00:00:00", "end": "2026-09-17 13:00:00", "message_count": 2,

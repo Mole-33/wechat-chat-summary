@@ -3,12 +3,123 @@ import os
 import tempfile
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from listeners.wechat4_reader import EphemeralWeChatDB, WeChat4Reader
-from vendor.wechat4_db import PAGE_SZ, WeChatDB, _decrypt_page
+from vendor.wechat4_db import (
+    PAGE_SZ,
+    WeChatDB,
+    _chatroom_display_name_index,
+    _decrypt_page,
+)
+
+
+def _varint(value):
+    output = bytearray()
+    while value >= 0x80:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+    return bytes(output)
+
+
+def _bytes_field(number, value):
+    value = value if isinstance(value, bytes) else value.encode("utf-8")
+    return _varint((number << 3) | 2) + _varint(len(value)) + value
+
+
+def _chatroom_member_record(username, display_name=""):
+    member = _bytes_field(1, username)
+    if display_name:
+        member += _bytes_field(2, display_name)
+    return _bytes_field(1, member)
 
 
 class RangeQueryTests(unittest.TestCase):
+    def test_chatroom_display_names_are_decoded_from_ext_buffer(self):
+        blob = (
+            _chatroom_member_record("wxid_alice", "Alice 的群昵称")
+            + _chatroom_member_record("wxid_bob")
+            + _bytes_field(9, b"ignored")
+        )
+        self.assertEqual(
+            _chatroom_display_name_index(blob),
+            {"wxid_alice": "Alice 的群昵称"},
+        )
+        self.assertEqual(_chatroom_display_name_index(b"\x0a\xff"), {})
+
+    def test_group_members_include_group_specific_display_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contact.db")
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                "CREATE TABLE chat_room(id INTEGER, username TEXT, owner TEXT, ext_buffer BLOB);"
+                "CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);"
+                "CREATE TABLE contact(id INTEGER, username TEXT, nick_name TEXT, remark TEXT);"
+            )
+            ext_buffer = _chatroom_member_record("wxid_alice", "群内 Alice")
+            conn.execute("INSERT INTO chat_room VALUES(1, 'room@chatroom', 'wxid_alice', ?)", (ext_buffer,))
+            conn.execute("INSERT INTO chatroom_member VALUES(1, 7)")
+            conn.execute("INSERT INTO contact VALUES(7, 'wxid_alice', '微信 Alice', '备注 Alice')")
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+
+            def contact_conn():
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._contact_conn = contact_conn
+            members = db.get_group_members("room@chatroom")
+
+        self.assertEqual(len(members), 1)
+        self.assertEqual(members[0]["display_name"], "群内 Alice")
+        self.assertTrue(members[0]["is_owner"])
+
+    def test_reader_prefers_group_name_for_members_and_self(self):
+        class FakeDB:
+            wxid = "wxid_self"
+
+            def __init__(self):
+                self.member_reads = 0
+
+            def get_group_members(self, _group_id):
+                self.member_reads += 1
+                return [
+                    {
+                        "username": "wxid_alice", "display_name": "群内 Alice",
+                        "remark": "备注 Alice", "nick_name": "微信 Alice",
+                    },
+                    {
+                        "username": "wxid_self", "display_name": "群内的我",
+                        "remark": "", "nick_name": "账号昵称",
+                    },
+                ]
+
+            def get_self_info(self):
+                return {"nick_name": "账号昵称"}
+
+        reader = WeChat4Reader()
+        reader.db = FakeDB()
+        incoming = reader._convert("room", "群", {
+            "local_id": 1, "sort_seq": 1, "type": "文本", "sender_id": 7,
+            "sender_username": "wxid_alice", "create_time": 1789574400, "content": "测试",
+        })
+        outgoing = reader._convert("room", "群", {
+            "local_id": 2, "sort_seq": 2, "type": "文本", "sender_id": 2,
+            "sender_username": "", "create_time": 1789574401, "content": "测试",
+        })
+        self.assertEqual(incoming.sender_nickname, "群内 Alice")
+        self.assertEqual(outgoing.sender_nickname, "群内的我")
+        self.assertEqual(reader.db.member_reads, 1)
+
+        with patch("listeners.wechat4_reader.time.monotonic", return_value=10_000):
+            reader._member_cache_time["room"] = 0
+            reader._members("room")
+        self.assertEqual(reader.db.member_reads, 2)
+
     def test_ephemeral_key_loading_rejects_a_different_running_account(self):
         db = EphemeralWeChatDB.__new__(EphemeralWeChatDB)
         db._db_files = []
@@ -114,6 +225,9 @@ class RangeQueryTests(unittest.TestCase):
             def get_self_info(self):
                 return {"nick_name": "我"}
 
+            def get_group_members(self, _group_id):
+                return []
+
         reader = WeChat4Reader()
         reader.db = FakeDB()
         events = []
@@ -132,7 +246,10 @@ class RangeQueryTests(unittest.TestCase):
             wxid = "self"
 
             def get_group_members(self, _group_id):
-                return []
+                return [{
+                    "username": "", "display_name": "错误名称",
+                    "remark": "", "nick_name": "",
+                }]
 
             def get_nickname(self, _sender_id):
                 raise AssertionError("内部数字 sender_id 不应查询 contact.db")

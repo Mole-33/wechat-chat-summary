@@ -88,6 +88,10 @@ class GUIStateManager:
         self.monitor_watermarks: Dict[str, int] = {}
         self.is_monitoring = False
         self.should_exit = False
+        self.startup_state = "idle"
+        self.startup_message = ""
+        self._startup_restore_started = False
+        self._startup_restore_thread: Optional[threading.Thread] = None
         self._stop_monitor = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
@@ -106,10 +110,58 @@ class GUIStateManager:
             "connected": self.reader.connected,
             "account": self.account_info,
             "is_monitoring": self.is_monitoring,
+            "startup_state": self.startup_state,
+            "startup_message": self.startup_message,
             "selected_groups": selected,
             "live_message_count": len(self.live_messages),
             "schedule_enabled": bool(self.settings.get("schedule_enabled", False)),
         }
+
+    def restore_saved_session_async(self) -> bool:
+        """Reconnect the saved account and resume live reads once per launch."""
+        account = str(self.settings.get("selected_account", "") or "").strip()
+        selected = list(self.settings.get("selected_groups", []) or [])
+        if not account or not selected:
+            self.startup_state = "idle"
+            self.startup_message = ""
+            return False
+        with self._lock:
+            if self._startup_restore_started:
+                return False
+            self._startup_restore_started = True
+            self.startup_state = "connecting"
+            self.startup_message = "正在自动连接微信并开启实时读取"
+            self._startup_restore_thread = threading.Thread(
+                target=self._restore_saved_session_worker,
+                args=(account, selected),
+                daemon=True,
+            )
+            self._startup_restore_thread.start()
+        return True
+
+    def _restore_saved_session_worker(self, account: str, selected: List[Dict[str, str]]) -> None:
+        try:
+            if self.should_exit:
+                return
+            self.connect(account)
+            available = {
+                item["id"]: {"id": item["id"], "name": item["name"]}
+                for item in self.groups.values()
+                if item.get("id")
+            }
+            restored = [available[item.get("id")] for item in selected if item.get("id") in available]
+            if not restored:
+                raise RuntimeError("上次选择的群聊已不存在，请重新选择群聊")
+            if restored != selected:
+                self.settings.set("selected_groups", restored)
+            if self.should_exit:
+                return
+            result = self.start_monitoring()
+            self.startup_state = "monitoring"
+            self.startup_message = result.get("message", "实时读取已自动开启")
+        except Exception as exc:
+            self.startup_state = "error"
+            self.startup_message = f"自动开启实时读取失败：{exc}"
 
     def connect(self, account: str) -> Dict[str, Any]:
         self.stop_monitoring()
@@ -559,8 +611,10 @@ class AppHTTPRequestHandler(BaseHTTPRequestHandler):
             self._error(exc)
 
 
-def run_gui_server(port: int = 18989):
+def run_gui_server(port: int = 18989, restore_saved_session: bool = True):
     server = ThreadingHTTPServer(("127.0.0.1", port), AppHTTPRequestHandler)
+    if restore_saved_session:
+        state.restore_saved_session_async()
     server.serve_forever()
 
 

@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { settings: {}, groups: [], selected: new Set(), providers: [], jobId: "", status: {} };
+const state = { settings: {}, groups: [], selected: new Set(), providers: [], jobId: "", status: {}, startupNotice: "" };
 const providerDefaults = {
   openai: ["OpenAI", "https://api.openai.com/v1"],
   deepseek: ["DeepSeek", "https://api.deepseek.com"],
@@ -51,10 +51,14 @@ async function refreshStatus() {
   try {
     state.status = await api("/api/status"); const connected = state.status.connected;
     $("wechatBadge").className = `status-pill ${connected ? "status-on" : "status-off"}`;
-    $("wechatBadge").querySelector("span").textContent = connected ? `已连接 ${state.status.account.nickname || state.status.account.wxid}` : (state.status.wechat_running ? "微信运行中 · 未连接" : "未检测到微信");
+    const startupConnecting = !connected && state.status.startup_state === "connecting";
+    $("wechatBadge").querySelector("span").textContent = connected ? `已连接 ${state.status.account.nickname || state.status.account.wxid}` : (startupConnecting ? "正在自动连接微信…" : (state.status.wechat_running ? "微信运行中 · 未连接" : "未检测到微信"));
     $("accountState").className = `badge ${connected ? "badge-green" : "badge-gray"}`; $("accountState").textContent = connected ? "已连接" : "未连接";
     $("monitorBadge").className = `badge ${state.status.is_monitoring ? "badge-green" : "badge-gray"}`; $("monitorBadge").textContent = state.status.is_monitoring ? "读取中" : "已停止";
     $("btnMonitor").textContent = state.status.is_monitoring ? "■ 停止实时读取" : "▶ 启动实时读取";
+    if (state.status.startup_state === "error" && state.status.startup_message && state.startupNotice !== state.status.startup_message) {
+      state.startupNotice = state.status.startup_message; toast(state.status.startup_message, "error");
+    }
   } catch (_) {}
 }
 

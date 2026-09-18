@@ -46,13 +46,14 @@ class StorageManager:
                 CREATE TABLE IF NOT EXISTS daily_member_stats (
                     group_id TEXT NOT NULL,
                     date_str TEXT NOT NULL,
+                    member_key TEXT NOT NULL,
                     nickname TEXT NOT NULL,
                     message_count INTEGER NOT NULL,
                     total_words INTEGER NOT NULL,
                     first_time TEXT,
                     last_time TEXT,
                     rank_no INTEGER NOT NULL,
-                    PRIMARY KEY (group_id, date_str, nickname)
+                    PRIMARY KEY (group_id, date_str, member_key)
                 );
                 CREATE TABLE IF NOT EXISTS daily_hour_stats (
                     group_id TEXT NOT NULL,
@@ -67,6 +68,36 @@ class StorageManager:
                 );
                 """
             )
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(daily_member_stats)")
+            }
+            if "member_key" not in columns:
+                # Older releases keyed rows by nickname. Preserve their
+                # aggregate history; refreshed dates receive hashed identities.
+                conn.execute("ALTER TABLE daily_member_stats RENAME TO daily_member_stats_legacy")
+                conn.execute(
+                    """CREATE TABLE daily_member_stats (
+                        group_id TEXT NOT NULL,
+                        date_str TEXT NOT NULL,
+                        member_key TEXT NOT NULL,
+                        nickname TEXT NOT NULL,
+                        message_count INTEGER NOT NULL,
+                        total_words INTEGER NOT NULL,
+                        first_time TEXT,
+                        last_time TEXT,
+                        rank_no INTEGER NOT NULL,
+                        PRIMARY KEY (group_id, date_str, member_key)
+                    )"""
+                )
+                conn.execute(
+                    """INSERT INTO daily_member_stats
+                    (group_id,date_str,member_key,nickname,message_count,total_words,
+                     first_time,last_time,rank_no)
+                    SELECT group_id,date_str,'legacy:' || nickname,nickname,
+                           message_count,total_words,first_time,last_time,rank_no
+                    FROM daily_member_stats_legacy"""
+                )
+                conn.execute("DROP TABLE daily_member_stats_legacy")
             conn.commit()
 
     def replace_daily_summary(self, group_id: str, summary: GroupDailySummary) -> None:
@@ -97,11 +128,12 @@ class StorageManager:
             )
             conn.executemany(
                 """INSERT INTO daily_member_stats
-                (group_id, date_str, nickname, message_count, total_words,
-                 first_time, last_time, rank_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (group_id, date_str, member_key, nickname, message_count, total_words,
+                 first_time, last_time, rank_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
-                        group_id, summary.date_str, stat.nickname,
+                        group_id, summary.date_str,
+                        stat.member_key or f"legacy:{stat.nickname}", stat.nickname,
                         stat.message_count, stat.total_words,
                         stat.first_msg_time, stat.last_msg_time, stat.rank,
                     )
@@ -140,6 +172,7 @@ class StorageManager:
         for row in members:
             stats.append(MemberDailyStat(
                 nickname=row["nickname"],
+                member_key=row["member_key"],
                 message_count=row["message_count"],
                 total_words=row["total_words"],
                 ratio=(row["message_count"] / total) if total else 0.0,
@@ -197,4 +230,3 @@ class StorageManager:
             return json.loads(row["meta_value"])
         except json.JSONDecodeError:
             return default
-

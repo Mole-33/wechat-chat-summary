@@ -123,6 +123,7 @@ def run() -> None:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     LOGGER.info("本地服务已启动：%s", url)
+    state.restore_saved_session_async()
 
     try:
         if not launch_default_browser(url):

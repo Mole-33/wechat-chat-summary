@@ -37,6 +37,7 @@ class ChatMessage:
 class MemberDailyStat:
     """单个群员一天的聊天统计数据"""
     nickname: str
+    member_key: str = ""
     message_count: int = 0
     total_words: int = 0
     ratio: float = 0.0  # 占当天总发言比例 (0.0 - 1.0)

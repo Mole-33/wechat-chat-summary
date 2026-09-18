@@ -1,6 +1,7 @@
-from typing import List, Dict
+import hashlib
 from collections import defaultdict
 from datetime import datetime
+from typing import List, Dict
 
 from core.models import ChatMessage, MemberDailyStat, GroupDailySummary
 
@@ -59,9 +60,11 @@ class StatsEngine:
         total_messages = len(valid_messages)
         total_words = sum(m.word_count for m in valid_messages)
 
-        # 2. 按群员昵称分组聚合
-        # member_dict: nickname -> {count, words, first_time, last_time}
+        # 2. 按群员身份分组聚合。昵称可能重复，“未知成员”也可能对应多人；
+        # 有 sender_id 时必须用稳定身份聚合，避免把不同成员错误合并。
         member_dict: Dict[str, Dict] = defaultdict(lambda: {
+            "nickname": "未知昵称",
+            "member_key": "",
             "count": 0,
             "words": 0,
             "first_time": None,
@@ -73,7 +76,11 @@ class StatsEngine:
 
         for m in valid_messages:
             nick = m.sender_nickname.strip() or "未知昵称"
-            info = member_dict[nick]
+            sender_id = str(m.sender_id).strip() if m.sender_id is not None else ""
+            member_key = f"id:{sender_id}" if sender_id else f"nickname:{nick}"
+            info = member_dict[member_key]
+            info["nickname"] = nick
+            info["member_key"] = member_key
             info["count"] += 1
             info["words"] += m.word_count
             time_str = m.time_str
@@ -86,11 +93,12 @@ class StatsEngine:
 
         # 3. 生成群员统计列表并排序
         member_stats: List[MemberDailyStat] = []
-        for nick, info in member_dict.items():
+        for info in member_dict.values():
             count = info["count"]
             ratio = (count / total_messages) if total_messages > 0 else 0.0
             member_stats.append(MemberDailyStat(
-                nickname=nick,
+                nickname=info["nickname"],
+                member_key=hashlib.sha256(info["member_key"].encode("utf-8")).hexdigest(),
                 message_count=count,
                 total_words=info["words"],
                 ratio=ratio,

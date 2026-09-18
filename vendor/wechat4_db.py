@@ -183,6 +183,92 @@ def _sqlite_text_factory(data: bytes):
         return data
 
 
+def _protobuf_fields(data: bytes) -> List[Tuple[int, int, object]]:
+    """Decode the small protobuf subset used by chat_room.ext_buffer.
+
+    Unknown or malformed input returns an empty list so a WeChat schema change
+    falls back to contact names instead of breaking all message reads.
+    """
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    if not isinstance(data, bytes):
+        return []
+
+    def read_varint(position: int) -> Tuple[int, int]:
+        value = 0
+        shift = 0
+        while position < len(data) and shift < 70:
+            current = data[position]
+            position += 1
+            value |= (current & 0x7F) << shift
+            if current < 0x80:
+                return value, position
+            shift += 7
+        raise ValueError("invalid protobuf varint")
+
+    fields: List[Tuple[int, int, object]] = []
+    position = 0
+    try:
+        while position < len(data):
+            key, position = read_varint(position)
+            field_number, wire_type = key >> 3, key & 0x07
+            if field_number <= 0:
+                raise ValueError("invalid protobuf field")
+            if wire_type == 0:
+                value, position = read_varint(position)
+            elif wire_type == 1:
+                value = data[position:position + 8]
+                position += 8
+            elif wire_type == 2:
+                size, position = read_varint(position)
+                end = position + size
+                if size < 0 or end > len(data):
+                    raise ValueError("invalid protobuf length")
+                value = data[position:end]
+                position = end
+            elif wire_type == 5:
+                value = data[position:position + 4]
+                position += 4
+            else:
+                raise ValueError("unsupported protobuf wire type")
+            if position > len(data):
+                raise ValueError("truncated protobuf field")
+            fields.append((field_number, wire_type, value))
+    except (IndexError, TypeError, ValueError):
+        return []
+    return fields
+
+
+def _chatroom_display_name_index(ext_buffer) -> Dict[str, str]:
+    """Return member username -> group-specific display name for WeChat 4.x.
+
+    ``chat_room.ext_buffer`` contains repeated field 1 member records. Within
+    each record, field 1 is the member username and field 2 is the name shown
+    specifically in that group.
+    """
+    names: Dict[str, str] = {}
+    for field_number, wire_type, value in _protobuf_fields(ext_buffer):
+        if field_number != 1 or wire_type != 2:
+            continue
+        member_fields = _protobuf_fields(value)
+        username_raw = next(
+            (item for number, kind, item in member_fields if number == 1 and kind == 2),
+            b"",
+        )
+        display_raw = next(
+            (item for number, kind, item in member_fields if number == 2 and kind == 2),
+            b"",
+        )
+        try:
+            username = username_raw.decode("utf-8").strip()
+            display_name = display_raw.decode("utf-8").strip()
+        except (AttributeError, UnicodeDecodeError):
+            continue
+        if username and display_name:
+            names[username] = display_name
+    return names
+
+
 # ---------------------------------------------------------------------------
 # 主密钥 cfg 提取(ReadWeixinKey-rev 同源; 锚点每版本重采)
 # ---------------------------------------------------------------------------
@@ -2213,11 +2299,12 @@ class WeChatDB:
             return []
         try:
             room = conn.execute(
-                "SELECT id, owner FROM chat_room WHERE username=? LIMIT 1",
+                "SELECT id, owner, ext_buffer FROM chat_room WHERE username=? LIMIT 1",
                 (chatroom_wxid,),
             ).fetchone()
             if not room:
                 return []
+            display_names = _chatroom_display_name_index(room["ext_buffer"])
             rows = conn.execute(
                 "SELECT m.member_id, c.username, c.nick_name, c.remark "
                 "FROM chatroom_member m "
@@ -2231,6 +2318,7 @@ class WeChatDB:
         for r in rows:
             members.append({
                 "username": r["username"],
+                "display_name": display_names.get(r["username"], ""),
                 "nick_name": r["nick_name"],
                 "remark": r["remark"],
                 "is_owner": r["username"] == room["owner"],

@@ -250,6 +250,7 @@ class WeChat4Reader:
         self.account = ""
         self._temp: Optional[tempfile.TemporaryDirectory] = None
         self._member_cache: Dict[str, Dict[str, str]] = {}
+        self._member_cache_time: Dict[str, float] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -311,6 +312,7 @@ class WeChat4Reader:
                 self.db = None
             self.account = ""
             self._member_cache.clear()
+            self._member_cache_time.clear()
             gc.collect()
             if self._temp is not None:
                 try:
@@ -340,25 +342,42 @@ class WeChat4Reader:
         return groups
 
     def _members(self, group_id: str) -> Dict[str, str]:
-        if group_id not in self._member_cache:
-            db = self._require_db()
-            self._member_cache[group_id] = {
-                item.get("username", ""): (
-                    item.get("remark") or item.get("nick_name") or item.get("username") or "未知成员"
-                )
-                for item in db.get_group_members(group_id)
-            }
-        return self._member_cache[group_id]
+        with self._lock:
+            refreshed_at = self._member_cache_time.get(group_id, 0.0)
+            if group_id not in self._member_cache or time.monotonic() - refreshed_at >= 60.0:
+                db = self._require_db()
+                members: Dict[str, str] = {}
+                for item in db.get_group_members(group_id):
+                    username = str(item.get("username") or "").strip()
+                    if not username:
+                        continue
+                    members[username] = (
+                        item.get("display_name") or item.get("remark")
+                        or item.get("nick_name") or item.get("username") or "未知成员"
+                    )
+                self._member_cache[group_id] = members
+                self._member_cache_time[group_id] = time.monotonic()
+            return self._member_cache[group_id]
 
-    def _convert(self, group_id: str, group_name: str, row: dict) -> ChatMessage:
+    def _convert(
+        self,
+        group_id: str,
+        group_name: str,
+        row: dict,
+        members: Optional[Dict[str, str]] = None,
+    ) -> ChatMessage:
         db = self._require_db()
+        if members is None:
+            members = self._members(group_id)
         if row.get("sender_id") == 2:
-            info = db.get_self_info()
-            sender = info.get("nick_name") or info.get("remark") or "我"
             sender_id = db.wxid
+            sender = members.get(sender_id)
+            if not sender:
+                info = db.get_self_info()
+                sender = info.get("remark") or info.get("nick_name") or "我"
         else:
             sender_id = row.get("sender_username") or str(row.get("sender_id") or "")
-            sender = self._members(group_id).get(sender_id)
+            sender = members.get(sender_id)
             if not sender:
                 # 纯数字 sender_id 是 message_resource 的内部 rowid，不是微信号；
                 # 映射缺失时避免为每条消息重复打开 contact.db 做无效查询。
@@ -403,9 +422,10 @@ class WeChat4Reader:
         if progress:
             progress(70, f"已定位 {len(rows)} 条文字消息，正在解析群成员")
         messages: List[ChatMessage] = []
+        members = self._members(group_id) if rows else {}
         total = max(len(rows), 1)
         for index, row in enumerate(rows, 1):
-            messages.append(self._convert(group_id, group_name, row))
+            messages.append(self._convert(group_id, group_name, row, members))
             if progress and (index == total or index % 1000 == 0):
                 progress(70 + round(index / total * 30), f"正在解析聊天记录 {index}/{len(rows)}")
         rows.clear()
@@ -417,8 +437,9 @@ class WeChat4Reader:
 
     def read_new(self, group_id: str, group_name: str, since_seq: int) -> dict:
         rows = self._require_db().get_new_messages(group_id, since_seq=since_seq, limit=500)
+        members = self._members(group_id) if rows else {}
         converted = [
-            self._convert(group_id, group_name, row)
+            self._convert(group_id, group_name, row, members)
             for row in rows
             if row.get("type") == "文本"
         ]

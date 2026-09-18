@@ -15,7 +15,7 @@ class TestGUIServer(unittest.TestCase):
     def setUpClass(cls):
         cls.port = 18991
         cls.base_url = f"http://127.0.0.1:{cls.port}"
-        threading.Thread(target=run_gui_server, args=(cls.port,), daemon=True).start()
+        threading.Thread(target=run_gui_server, args=(cls.port, False), daemon=True).start()
         time.sleep(0.5)
 
     def test_status_endpoint_has_privacy_safe_state(self):
@@ -24,7 +24,54 @@ class TestGUIServer(unittest.TestCase):
         data = json.loads(response.read().decode("utf-8"))
         self.assertIn("wechat_running", data)
         self.assertIn("connected", data)
+        self.assertIn("startup_state", data)
         self.assertNotIn("api_key", json.dumps(data).lower())
+
+    def test_saved_account_and_groups_auto_resume_monitoring(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+        values = {
+            "selected_account": "account-a",
+            "selected_groups": [{"id": "room@chatroom", "name": "旧群名"}],
+        }
+        manager.settings = SimpleNamespace(
+            get=lambda key, default=None: values.get(key, default),
+            set=lambda key, value: values.__setitem__(key, value),
+        )
+        manager.groups = {}
+        manager.should_exit = False
+        manager.startup_state = "idle"
+        manager.startup_message = ""
+        manager._startup_restore_started = False
+        manager._startup_restore_thread = None
+        manager._lock = threading.RLock()
+
+        def connect(account):
+            self.assertEqual(account, "account-a")
+            manager.groups = {
+                "room@chatroom": {"id": "room@chatroom", "name": "新群名"},
+            }
+
+        manager.connect = connect
+        manager.start_monitoring = lambda: {"success": True, "message": "已自动开启"}
+
+        with patch("gui.server.threading.Thread") as thread_cls:
+            self.assertTrue(manager.restore_saved_session_async())
+            thread_cls.call_args.kwargs["target"](*thread_cls.call_args.kwargs["args"])
+
+        self.assertEqual(manager.startup_state, "monitoring")
+        self.assertEqual(manager.startup_message, "已自动开启")
+        self.assertEqual(values["selected_groups"][0]["name"], "新群名")
+        self.assertFalse(manager.restore_saved_session_async())
+
+    def test_auto_resume_skips_when_no_saved_groups(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+        manager.settings = SimpleNamespace(
+            get=lambda key, default=None: "account-a" if key == "selected_account" else [],
+        )
+        manager.startup_state = "unused"
+        manager.startup_message = "unused"
+        self.assertFalse(manager.restore_saved_session_async())
+        self.assertEqual(manager.startup_state, "idle")
 
     def test_accounts_and_groups_endpoints(self):
         accounts = json.loads(urllib.request.urlopen(f"{self.base_url}/api/accounts").read())
