@@ -37,6 +37,9 @@ class TestGUIServer(unittest.TestCase):
         self.assertIn("微信群聊 AI 总结助手", html)
         self.assertIn("隐私边界", html)
         self.assertIn("立即开始总结", html)
+        script = urllib.request.urlopen(f"{self.base_url}/app.js").read().decode("utf-8")
+        self.assertIn("未保存 API Key", script)
+        self.assertIn("未选择模型", script)
         self.assertNotIn("估算消息量与调用次数", html)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/style.css").status, 200)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/app.js").status, 200)
@@ -63,7 +66,7 @@ class TestGUIServer(unittest.TestCase):
         manager.groups = {}
         manager.settings = SimpleNamespace(get=lambda _key, default=None: default)
         manager.summary_jobs = {}
-        manager._client = lambda _provider_id: object()
+        manager._client = lambda _provider_id, require_model=False: object()
 
         with patch("gui.server.threading.Thread") as thread_cls, patch("gui.server.notify"):
             job_id = manager.start_summary_job(
@@ -79,6 +82,28 @@ class TestGUIServer(unittest.TestCase):
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["progress"], 100)
         self.assertEqual(list(job["errors"]), ["missing@chatroom"])
+
+    def test_summary_client_rejects_missing_key_before_reading_messages(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+        manager.settings = SimpleNamespace(
+            provider_with_secret=lambda _provider_id: {
+                "id": "provider-id", "base_url": "https://api.example/v1",
+                "model": "model-a", "api_key": "",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "尚未保存 API Key"):
+            manager._client("provider-id", require_model=True)
+
+    def test_summary_client_rejects_missing_model_before_reading_messages(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+        manager.settings = SimpleNamespace(
+            provider_with_secret=lambda _provider_id: {
+                "id": "provider-id", "base_url": "https://api.example/v1",
+                "model": "", "api_key": "secret",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "尚未选择模型"):
+            manager._client("provider-id", require_model=True)
 
 
 if __name__ == "__main__":

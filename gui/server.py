@@ -219,10 +219,14 @@ class GUIStateManager:
             }
         return _summary_json(summary, self.account_info.get("nickname", ""))
 
-    def _client(self, provider_id: str) -> CompatibleAIClient:
+    def _client(self, provider_id: str, require_model: bool = False) -> CompatibleAIClient:
         profile = self.settings.provider_with_secret(provider_id)
         if not profile:
             raise ValueError("请选择有效的 AI 平台配置")
+        if not str(profile.get("api_key") or "").strip():
+            raise ValueError("该平台尚未保存 API Key，请先打开“AI 与代理设置”填写并保存")
+        if require_model and not str(profile.get("model") or "").strip():
+            raise ValueError("该平台尚未选择模型，请先自动获取或手动填写模型名称并保存")
         return CompatibleAIClient(
             profile,
             proxy_url=self.settings.get("proxy_url", ""),
@@ -239,7 +243,7 @@ class GUIStateManager:
             raise ValueError("请至少选择一个群聊")
         if not self.reader.connected:
             raise RuntimeError("请先连接微信账号")
-        self._client(provider_id)  # validate before creating the job
+        client = self._client(provider_id, require_model=True)
         job_id = uuid.uuid4().hex
         self.summary_jobs[job_id] = {
             "id": job_id, "status": "queued", "progress": 0,
@@ -273,8 +277,6 @@ class GUIStateManager:
                         )
                     job["progress"] = round((completed + 0.25) / group_total * 100)
                     job["message"] = f"【{group['name']}】已读取 {len(messages)} 条，准备调用 AI"
-                    client = self._client(provider_id)
-
                     def progress(call_index, total_calls, text):
                         group_base = completed / len(group_ids)
                         call_ratio = max(0, min(call_index / max(total_calls, 1), 1))

@@ -8,18 +8,15 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
-import shutil
 import socket
-import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import urllib.request
 import webbrowser
 from pathlib import Path
 
-from config import APP_NAME, APP_VERSION, LOGS_DIR, RUNTIME_DIR
+from config import APP_NAME, APP_VERSION, LOGS_DIR
 
 
 LOGGER = logging.getLogger("wechat_ai_summary")
@@ -67,58 +64,23 @@ def find_existing_instance() -> str:
     return ""
 
 
-def find_browser_app_executable() -> str:
-    candidates = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]
-    return next((path for path in candidates if os.path.isfile(path)), "")
-
-
 def open_existing_dashboard(url: str) -> None:
     LOGGER.info("检测到已运行实例：%s", url)
-    if not webbrowser.open(url, new=1):
+    if not webbrowser.open(url, new=2):
         show_error(f"应用已在后台运行，请在浏览器中打开：\n{url}")
 
 
-def launch_app_window(url: str) -> tuple[subprocess.Popen | None, Path | None]:
+def launch_default_browser(url: str) -> bool:
+    """Open the dashboard with the user's Windows default browser."""
     if os.getenv("WECHAT_AI_SUMMARY_NO_BROWSER") == "1":
-        LOGGER.info("测试模式：跳过浏览器窗口")
-        return None, None
-    browser_exe = find_browser_app_executable()
-    if not browser_exe:
-        webbrowser.open(url, new=1)
-        return None, None
-    profile_dir = Path(tempfile.mkdtemp(prefix="ui-", dir=RUNTIME_DIR))
-    command = [
-        browser_exe,
-        f"--app={url}",
-        f"--user-data-dir={profile_dir}",
-        "--window-size=1360,880",
-        f"--app-title={APP_NAME}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-background-mode",
-    ]
-    LOGGER.info("启动界面：%s", Path(browser_exe).name)
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return process, profile_dir
-
-
-def remove_temporary_profile(profile_dir: Path | None, retries: int = 20) -> bool:
-    if not profile_dir:
+        LOGGER.info("测试模式：跳过默认浏览器")
         return True
-    for _ in range(max(1, retries)):
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        if not profile_dir.exists():
-            return True
-        time.sleep(0.25)
-    LOGGER.warning("临时浏览器目录未能立即清理，将由系统临时目录策略处理：%s", profile_dir)
-    return False
+    opened = bool(webbrowser.open(url, new=2))
+    if opened:
+        LOGGER.info("已使用系统默认浏览器打开：%s", url)
+    else:
+        LOGGER.warning("系统未能自动打开默认浏览器：%s", url)
+    return opened
 
 
 def _create_single_instance_mutex():
@@ -162,27 +124,15 @@ def run() -> None:
     server_thread.start()
     LOGGER.info("本地服务已启动：%s", url)
 
-    app_process = None
-    profile_dir = None
     try:
-        app_process, profile_dir = launch_app_window(url)
+        if not launch_default_browser(url):
+            show_error(f"无法自动打开默认浏览器，请手动访问：\n{url}", log_path)
         while not state.should_exit:
-            if app_process is not None and app_process.poll() is not None:
-                LOGGER.info("界面窗口已关闭，应用同步退出")
-                state.should_exit = True
-                break
             time.sleep(0.5)
     finally:
         state.cleanup()
         server.shutdown()
         server.server_close()
-        if app_process is not None and app_process.poll() is None:
-            app_process.terminate()
-            try:
-                app_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                app_process.kill()
-        remove_temporary_profile(profile_dir)
         if mutex_handle and sys.platform == "win32":
             ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
