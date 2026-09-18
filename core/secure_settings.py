@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import uuid
+import urllib.parse
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,37 @@ def _looks_like_api_key(value: str) -> bool:
 def _valid_api_url(value: str) -> bool:
     value = str(value or "").strip().lower()
     return value.startswith(("http://", "https://")) and "://" in value
+
+
+def _normalize_provider_base_url(kind: str, value: str) -> str:
+    """Repair known provider website URLs to their documented API base."""
+    value = str(value or "").strip().rstrip("/")
+    if kind != "siliconflow" or not _valid_api_url(value):
+        return value
+    try:
+        hostname = (urllib.parse.urlsplit(value).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return value
+    if hostname == "siliconflow.cn" or hostname.endswith(".siliconflow.cn"):
+        return PROVIDER_DEFAULTS["siliconflow"]["base_url"]
+    return value
+
+
+def _normalize_proxy_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = "http://" + value
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError("代理地址格式不正确，请填写例如 http://127.0.0.1:7890") from None
+    return value.rstrip("/")
 
 
 class _DataBlob(ctypes.Structure):
@@ -118,9 +150,17 @@ class SettingsStore:
                     api_keys[profile_id] = base_url
                 profile["base_url"] = PROVIDER_DEFAULTS.get(kind, {}).get("base_url", "")
                 changed = True
-            elif kind in PROVIDER_DEFAULTS and kind != "custom" and not _valid_api_url(base_url):
-                profile["base_url"] = PROVIDER_DEFAULTS[kind]["base_url"]
-                changed = True
+            elif kind in PROVIDER_DEFAULTS and kind != "custom":
+                # Built-in providers always use the bundled official API base.
+                repaired = PROVIDER_DEFAULTS[kind]["base_url"]
+                if repaired != base_url.rstrip("/"):
+                    profile["base_url"] = repaired
+                    changed = True
+            else:
+                normalized = base_url.rstrip("/")
+                if normalized != base_url:
+                    profile["base_url"] = normalized
+                    changed = True
         if changed:
             self._settings["providers"] = providers
         return changed
@@ -184,14 +224,24 @@ class SettingsStore:
                 kind = "custom"
             profile_id = str(payload.get("id") or uuid.uuid4().hex)
             default = PROVIDER_DEFAULTS[kind]
-            submitted_base_url = str(payload.get("base_url") or "").strip()
+            raw_submitted_base_url = str(payload.get("base_url") or "").strip()
             submitted_api_key = payload.get("api_key")
-            if _looks_like_api_key(submitted_base_url):
+            if _looks_like_api_key(raw_submitted_base_url) and not submitted_api_key:
+                # Migrate values saved by older versions where the key could be
+                # pasted into the address field, even though built-ins now hide it.
+                submitted_api_key = raw_submitted_base_url
+            submitted_base_url = (
+                raw_submitted_base_url
+                if kind == "custom"
+                else default["base_url"]
+            )
+            if kind == "custom" and _looks_like_api_key(submitted_base_url):
                 if not submitted_api_key:
                     submitted_api_key = submitted_base_url
                 submitted_base_url = default["base_url"]
             if submitted_base_url and not _valid_api_url(submitted_base_url):
                 raise ValueError("API 地址必须以 http:// 或 https:// 开头，不能填写 API Key")
+            submitted_base_url = _normalize_provider_base_url(kind, submitted_base_url)
             profile = {
                 "id": profile_id,
                 "kind": kind,
@@ -226,7 +276,7 @@ class SettingsStore:
 
     def set_proxy(self, url: str, username: str = "", password: Optional[str] = None) -> None:
         with self._lock:
-            self._settings["proxy_url"] = str(url or "").strip()
+            self._settings["proxy_url"] = _normalize_proxy_url(url)
             self._settings["proxy_username"] = str(username or "").strip()
             if password is not None:
                 if password:

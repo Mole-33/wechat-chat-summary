@@ -255,6 +255,20 @@ class GUIStateManager:
         def worker():
             job = self.summary_jobs[job_id]
             job["status"] = "running"
+            if getattr(client, "profile", {}).get("kind") == "siliconflow":
+                job["progress"] = 1
+                job["message"] = "正在检查硅基流动 API、Key 与网络连接"
+                try:
+                    client.list_models()
+                except Exception as exc:
+                    for group_id in group_ids:
+                        job["errors"][group_id] = str(exc)
+                    job["status"] = "failed"
+                    job["progress"] = 100
+                    job["message"] = "AI 平台连接检查失败，尚未读取微信消息"
+                    job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    notify("群聊总结失败", f"硅基流动连接检查失败：{exc}")
+                    return
             completed = 0
             for group_id in group_ids:
                 messages = []

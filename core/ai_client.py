@@ -34,9 +34,10 @@ class CompatibleAIClient:
         self.profile = dict(profile)
         self.api_key = str(profile.get("api_key") or "")
         self.timeout = int(profile.get("timeout_seconds") or 180)
+        self.proxy_url = str(proxy_url or "").strip()
         handlers = []
-        if proxy_url:
-            handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        if self.proxy_url:
+            handlers.append(urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url}))
         self.opener = urllib.request.build_opener(*handlers)
         self.proxy_auth = ""
         if proxy_username:
@@ -62,6 +63,15 @@ class CompatibleAIClient:
                 raw = response.read().decode("utf-8", errors="replace")
             return json.loads(raw)
         except urllib.error.HTTPError as exc:
+            if exc.code in {301, 302, 303, 307, 308}:
+                location = str((exc.headers or {}).get("Location") or "")
+                host = urllib.parse.urlparse(location).hostname or "未知地址"
+                if host.endswith("siliconflow.cn"):
+                    raise APIClientError(
+                        "硅基流动 API 地址被重定向到网页登录页；"
+                        "请重新保存“硅基流动”内置平台，程序会自动使用官方 API 地址"
+                    ) from None
+                raise APIClientError(f"API 地址被重定向到 {host}，请检查是否填写了开放平台 API 地址") from None
             detail = exc.read().decode("utf-8", errors="replace")[:800]
             try:
                 parsed = json.loads(detail)
@@ -71,6 +81,20 @@ class CompatibleAIClient:
             raise APIClientError(f"平台返回 HTTP {exc.code}：{detail}") from None
         except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
             reason = getattr(exc, "reason", exc)
+            winerror = getattr(reason, "winerror", None)
+            if winerror == 10061 or isinstance(reason, ConnectionRefusedError):
+                if self.proxy_url:
+                    parsed_proxy = urllib.parse.urlparse(self.proxy_url)
+                    proxy_target = parsed_proxy.hostname or "本地代理"
+                    if parsed_proxy.port:
+                        proxy_target += f":{parsed_proxy.port}"
+                    raise APIClientError(
+                        f"无法连接代理 {proxy_target}；请启动代理软件，或在“AI 与代理设置”中清空代理地址"
+                    ) from None
+                raise APIClientError(
+                    "目标服务器拒绝连接；请确认选择的是内置平台，"
+                    "自定义接口则需检查服务地址和服务是否已启动"
+                ) from None
             raise APIClientError(f"无法连接 AI 平台：{reason}") from None
         except json.JSONDecodeError:
             raise APIClientError("平台返回了无法解析的响应") from None

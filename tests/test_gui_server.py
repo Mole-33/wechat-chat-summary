@@ -40,6 +40,8 @@ class TestGUIServer(unittest.TestCase):
         script = urllib.request.urlopen(f"{self.base_url}/app.js").read().decode("utf-8")
         self.assertIn("未保存 API Key", script)
         self.assertIn("未选择模型", script)
+        self.assertIn('id="providerBaseUrlFields" class="hidden"', html)
+        self.assertIn("内置平台固定使用官方 API", html)
         self.assertNotIn("估算消息量与调用次数", html)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/style.css").status, 200)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/app.js").status, 200)
@@ -104,6 +106,40 @@ class TestGUIServer(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "尚未选择模型"):
             manager._client("provider-id", require_model=True)
+
+    def test_siliconflow_preflight_failure_does_not_read_wechat_messages(self):
+        class Reader:
+            connected = True
+
+            def read_range(self, *_args, **_kwargs):
+                raise AssertionError("连接检查失败时不应读取微信消息")
+
+        class Client:
+            profile = {"kind": "siliconflow"}
+
+            def list_models(self):
+                raise RuntimeError("平台连接失败")
+
+        manager = GUIStateManager.__new__(GUIStateManager)
+        manager.reader = Reader()
+        manager.groups = {"room@chatroom": {"id": "room@chatroom", "name": "测试群"}}
+        manager.settings = SimpleNamespace(get=lambda _key, default=None: default)
+        manager.summary_jobs = {}
+        manager._client = lambda _provider_id, require_model=False: Client()
+
+        with patch("gui.server.threading.Thread") as thread_cls, patch("gui.server.notify"):
+            job_id = manager.start_summary_job(
+                ["room@chatroom"],
+                datetime(2026, 9, 17, 0, 0),
+                datetime(2026, 9, 17, 13, 0),
+                "provider-id",
+            )
+            thread_cls.call_args.kwargs["target"]()
+
+        job = manager.summary_jobs[job_id]
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["progress"], 100)
+        self.assertIn("尚未读取微信消息", job["message"])
 
 
 if __name__ == "__main__":
