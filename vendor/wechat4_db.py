@@ -642,10 +642,25 @@ class WeChatDB:
             if os.path.basename(path) != "contact.db":
                 continue
             conn = self._open(rel)
-            row = conn.execute(
-                "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
-                (self.wxid,),
-            ).fetchone()
+            columns = self._table_columns(conn, "contact")
+            if "username" not in columns:
+                conn.close()
+                continue
+            nick_expr = "nick_name" if "nick_name" in columns else "'' AS nick_name"
+            remark_expr = "remark" if "remark" in columns else "'' AS remark"
+            where = "username=?"
+            params = [self.wxid]
+            if "alias" in columns:
+                where += " OR alias=?"
+                params.append(self.wxid)
+            try:
+                row = conn.execute(
+                    f"SELECT username, {nick_expr}, {remark_expr} "
+                    f"FROM contact WHERE {where} LIMIT 1",
+                    tuple(params),
+                ).fetchone()
+            finally:
+                conn.close()
             if row:
                 return {"username": row[0], "nick_name": row[1], "remark": row[2]}
         return {"username": self.wxid, "nick_name": "", "remark": ""}
@@ -2243,6 +2258,17 @@ class WeChatDB:
                 return None
         return None
 
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set:
+        """Return a table's columns without assuming one WeChat 4.x schema."""
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone()
+        if not exists:
+            return set()
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
     def get_groups(self) -> List[dict]:
         """列出所有群聊。
 
@@ -2250,39 +2276,82 @@ class WeChatDB:
             List[dict]，每条：username(群 wxid), name(群名), owner(群主 wxid),
             member_count(成员数), members(List[dict] 成员详情，见 get_group_members)。
         """
+        room_by_id = {}
+        members = []
+        contact = {}
+        room_names = {}
         conn = self._contact_conn()
-        if not conn:
-            return []
-        try:
-            rooms = conn.execute(
-                "SELECT id, username, owner FROM chat_room"
-            ).fetchall()
-            room_by_id = {r["id"]: r for r in rooms}
-            if not room_by_id:
-                return []
-            placeholders = ",".join("?" * len(room_by_id))
-            members = conn.execute(
-                "SELECT room_id, member_id FROM chatroom_member "
-                "WHERE room_id IN (%s)" % placeholders,
-                tuple(room_by_id.keys()),
-            ).fetchall()
-            member_ids = sorted({m["member_id"] for m in members})
-            contact = {}
-            if member_ids:
-                mp = ",".join("?" * len(member_ids))
-                rows = conn.execute(
-                    "SELECT id, username, nick_name, remark FROM contact "
-                    "WHERE id IN (%s)" % mp, tuple(member_ids),
-                ).fetchall()
-                contact = {r["id"]: r for r in rows}
-            # 群 wxid -> 群名（contact 表里 @chatroom 行的 nick_name）
-            room_names = {}
-            for r in conn.execute(
-                    "SELECT username, nick_name FROM contact "
-                    "WHERE username LIKE '%@chatroom'").fetchall():
-                room_names[r["username"]] = r["nick_name"] or r["username"]
-        finally:
-            conn.close()
+        if conn is not None:
+            try:
+                contact_columns = self._table_columns(conn, "contact")
+                if "username" in contact_columns:
+                    nick_expr = "nick_name" if "nick_name" in contact_columns else "'' AS nick_name"
+                    for row in conn.execute(
+                        f"SELECT username, {nick_expr} FROM contact "
+                        "WHERE username LIKE '%@chatroom'"
+                    ).fetchall():
+                        room_names[row["username"]] = row["nick_name"] or row["username"]
+
+                room_columns = self._table_columns(conn, "chat_room")
+                if {"id", "username"}.issubset(room_columns):
+                    owner_expr = "owner" if "owner" in room_columns else "'' AS owner"
+                    rooms = conn.execute(
+                        f"SELECT id, username, {owner_expr} FROM chat_room"
+                    ).fetchall()
+                    room_by_id = {
+                        row["id"]: {
+                            "id": row["id"], "username": row["username"],
+                            "owner": row["owner"] or "",
+                        }
+                        for row in rooms if row["username"]
+                    }
+
+                member_columns = self._table_columns(conn, "chatroom_member")
+                if room_by_id and {"room_id", "member_id"}.issubset(member_columns):
+                    placeholders = ",".join("?" * len(room_by_id))
+                    members = conn.execute(
+                        "SELECT room_id, member_id FROM chatroom_member "
+                        "WHERE room_id IN (%s)" % placeholders,
+                        tuple(room_by_id.keys()),
+                    ).fetchall()
+                    member_ids = sorted({item["member_id"] for item in members})
+                    if member_ids and {"id", "username"}.issubset(contact_columns):
+                        nick_expr = "nick_name" if "nick_name" in contact_columns else "'' AS nick_name"
+                        remark_expr = "remark" if "remark" in contact_columns else "'' AS remark"
+                        mp = ",".join("?" * len(member_ids))
+                        rows = conn.execute(
+                            f"SELECT id, username, {nick_expr}, {remark_expr} FROM contact "
+                            "WHERE id IN (%s)" % mp, tuple(member_ids),
+                        ).fetchall()
+                        contact = {row["id"]: row for row in rows}
+            finally:
+                conn.close()
+
+        # Some WeChat 4.x builds keep active rooms in SessionTable even when
+        # chat_room is absent or has not yet been populated. Use it only as a
+        # same-account fallback and resolve names from contact when possible.
+        session_rooms = set()
+        for rel, path, _ in self._db_files:
+            if os.path.basename(path) != "session.db":
+                continue
+            session_conn = None
+            try:
+                session_conn = self._open(rel)
+                columns = self._table_columns(session_conn, "SessionTable")
+                if "username" in columns:
+                    session_rooms.update(
+                        row[0] for row in session_conn.execute(
+                            "SELECT username FROM SessionTable "
+                            "WHERE username LIKE '%@chatroom'"
+                        ).fetchall() if row[0]
+                    )
+            except (RuntimeError, sqlite3.DatabaseError):
+                pass
+            finally:
+                if session_conn is not None:
+                    session_conn.close()
+            break
+
         groups = []
         for rid, room in room_by_id.items():
             ms = []
@@ -2296,7 +2365,7 @@ class WeChatDB:
                     "username": c["username"],
                     "nick_name": c["nick_name"],
                     "remark": c["remark"],
-                    "is_owner": c["username"] == room["owner"],
+                    "is_owner": bool(room["owner"] and c["username"] == room["owner"]),
                 })
             groups.append({
                 "username": room["username"],
@@ -2304,6 +2373,15 @@ class WeChatDB:
                 "owner": room["owner"],
                 "member_count": len(ms),
                 "members": ms,
+            })
+        known = {item["username"] for item in groups}
+        for username in sorted((set(room_names) | session_rooms) - known):
+            groups.append({
+                "username": username,
+                "name": room_names.get(username, username),
+                "owner": "",
+                "member_count": 0,
+                "members": [],
             })
         return groups
 
@@ -2362,21 +2440,36 @@ class WeChatDB:
         conn = self._contact_conn()
         if not conn:
             return []
+        rows = []
         try:
+            room_columns = self._table_columns(conn, "chat_room")
+            if not {"id", "username"}.issubset(room_columns):
+                return []
+            owner_expr = "owner" if "owner" in room_columns else "'' AS owner"
+            ext_expr = "ext_buffer" if "ext_buffer" in room_columns else "NULL AS ext_buffer"
             room = conn.execute(
-                "SELECT id, owner, ext_buffer FROM chat_room WHERE username=? LIMIT 1",
+                f"SELECT id, {owner_expr}, {ext_expr} FROM chat_room "
+                "WHERE username=? LIMIT 1",
                 (chatroom_wxid,),
             ).fetchone()
             if not room:
                 return []
             display_names = _chatroom_display_name_index(room["ext_buffer"])
-            rows = conn.execute(
-                "SELECT m.member_id, c.username, c.nick_name, c.remark "
-                "FROM chatroom_member m "
-                "LEFT JOIN contact c ON c.id = m.member_id "
-                "WHERE m.room_id=? AND c.username IS NOT NULL",
-                (room["id"],),
-            ).fetchall()
+            member_columns = self._table_columns(conn, "chatroom_member")
+            contact_columns = self._table_columns(conn, "contact")
+            if (
+                {"room_id", "member_id"}.issubset(member_columns)
+                and {"id", "username"}.issubset(contact_columns)
+            ):
+                nick_expr = "c.nick_name" if "nick_name" in contact_columns else "'' AS nick_name"
+                remark_expr = "c.remark" if "remark" in contact_columns else "'' AS remark"
+                rows = conn.execute(
+                    f"SELECT m.member_id, c.username, {nick_expr}, {remark_expr} "
+                    "FROM chatroom_member m "
+                    "LEFT JOIN contact c ON c.id = m.member_id "
+                    "WHERE m.room_id=? AND c.username IS NOT NULL",
+                    (room["id"],),
+                ).fetchall()
         finally:
             conn.close()
         members = []
@@ -2386,8 +2479,15 @@ class WeChatDB:
                 "display_name": display_names.get(r["username"], ""),
                 "nick_name": r["nick_name"],
                 "remark": r["remark"],
-                "is_owner": r["username"] == room["owner"],
+                "is_owner": bool(room["owner"] and r["username"] == room["owner"]),
             })
+        known = {item["username"] for item in members}
+        for username, display_name in display_names.items():
+            if username not in known:
+                members.append({
+                    "username": username, "display_name": display_name,
+                    "nick_name": "", "remark": "", "is_owner": False,
+                })
         members.sort(key=lambda x: x["username"])
         return members
 

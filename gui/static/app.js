@@ -52,7 +52,8 @@ async function refreshStatus() {
     state.status = await api("/api/status"); const connected = state.status.connected;
     $("wechatBadge").className = `status-pill ${connected ? "status-on" : "status-off"}`;
     const startupConnecting = !connected && state.status.startup_state === "connecting";
-    $("wechatBadge").querySelector("span").textContent = connected ? `已连接 ${state.status.account.nickname || state.status.account.wxid}` : (startupConnecting ? "正在自动连接微信…" : (state.status.wechat_running ? "微信运行中 · 未连接" : "未检测到微信"));
+    const accountLabel = state.status.account?.nickname || state.status.account?.wxid || state.status.account?.account || state.settings.selected_account || "当前账号";
+    $("wechatBadge").querySelector("span").textContent = connected ? `已连接 ${accountLabel}` : (startupConnecting ? "正在自动连接微信…" : (state.status.wechat_running ? "微信运行中 · 未连接" : "未检测到微信"));
     $("accountState").className = `badge ${connected ? "badge-green" : "badge-gray"}`; $("accountState").textContent = connected ? "已连接" : "未连接";
     $("monitorBadge").className = `badge ${state.status.is_monitoring ? "badge-green" : "badge-gray"}`; $("monitorBadge").textContent = state.status.is_monitoring ? "读取中" : "已停止";
     $("btnMonitor").textContent = state.status.is_monitoring ? "■ 停止实时读取" : "▶ 启动实时读取";
@@ -67,7 +68,7 @@ async function connectWechat() {
   const btn = $("btnConnect"); btn.disabled = true; btn.textContent = "正在获取内存密钥并解密索引…";
   try {
     const data = await api("/api/wechat/connect", {method:"POST", body:JSON.stringify({account})});
-    state.groups = data.groups || []; renderGroups(); await refreshStatus(); toast(`已连接 ${data.account.nickname || data.account.wxid}`, "success");
+    state.groups = data.groups || []; renderGroups(); await refreshStatus(); toast(`已连接 ${data.account.nickname || data.account.wxid || data.account.account || "当前账号"}`, "success");
   } catch (e) { toast(e.message, "error"); if (/权限|解密信息/.test(e.message) && confirm("读取权限不足，是否以管理员身份重新启动应用？")) { try { await api("/api/wechat/relaunch-admin", {method:"POST", body:"{}"}); } catch (adminError) { toast(adminError.message,"error"); } } } finally { btn.disabled = false; btn.textContent = "授权并连接本地数据库"; }
 }
 

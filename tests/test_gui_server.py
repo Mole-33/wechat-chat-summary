@@ -79,6 +79,33 @@ class TestGUIServer(unittest.TestCase):
         self.assertIn("accounts", accounts)
         self.assertIn("groups", groups)
 
+    def test_connect_rolls_back_partial_connection_when_group_read_fails(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+
+        class FakeReader:
+            def __init__(self):
+                self.closed = False
+
+            def connect(self, _account):
+                return {"account": "account-a", "wxid": "wxid_a", "nickname": "A"}
+
+            def groups(self):
+                raise RuntimeError("不兼容的群聊表")
+
+            def close(self):
+                self.closed = True
+
+        manager.reader = FakeReader()
+        manager._db_lock = threading.RLock()
+        manager.account_info = {"account": "old"}
+        manager.groups = {"old": {}}
+        manager.stop_monitoring = lambda: None
+        with self.assertRaisesRegex(RuntimeError, "不兼容的群聊表"):
+            manager.connect("account-a")
+        self.assertTrue(manager.reader.closed)
+        self.assertEqual(manager.account_info, {})
+        self.assertEqual(manager.groups, {})
+
     def test_static_dashboard(self):
         html = urllib.request.urlopen(f"{self.base_url}/").read().decode("utf-8")
         self.assertIn("微信群聊 AI 总结助手", html)

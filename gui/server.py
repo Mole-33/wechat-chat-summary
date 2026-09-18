@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import ctypes
+import logging
 import mimetypes
 import os
 import sys
@@ -27,6 +28,9 @@ from core.storage import StorageManager
 from core.summarizer import summarize_messages, summary_to_markdown
 from core.updater import UpdateManager
 from listeners.wechat4_reader import WeChat4Reader
+
+
+LOGGER = logging.getLogger("wechat_ai_summary")
 
 
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -165,9 +169,21 @@ class GUIStateManager:
 
     def connect(self, account: str) -> Dict[str, Any]:
         self.stop_monitoring()
-        with self._db_lock:
-            info = self.reader.connect(account)
-            groups = self.reader.groups()
+        try:
+            with self._db_lock:
+                info = self.reader.connect(account)
+                groups = self.reader.groups()
+            if not groups:
+                raise RuntimeError(
+                    "已读取账号数据库，但没有找到群聊。请确认微信中至少有一个群聊；"
+                    "若群聊确实存在，请发送日志目录中的 app.log 以便继续兼容。"
+                )
+        except Exception:
+            with self._db_lock:
+                self.reader.close()
+            self.account_info = {}
+            self.groups = {}
+            raise
         self.account_info = info
         self.groups = {item["id"]: item for item in groups}
         self.settings.set("selected_account", account)
@@ -444,6 +460,7 @@ class AppHTTPRequestHandler(BaseHTTPRequestHandler):
         return parsed if isinstance(parsed, dict) else {}
 
     def _error(self, exc: Exception):
+        LOGGER.exception("本地接口处理失败：%s", self.path)
         code = 400 if isinstance(exc, (ValueError, APIClientError)) else 500
         self._json({"success": False, "message": str(exc)}, code)
 

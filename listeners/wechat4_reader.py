@@ -248,6 +248,7 @@ class WeChat4Reader:
     def __init__(self):
         self.db: Optional[EphemeralWeChatDB] = None
         self.account = ""
+        self._self_username = ""
         self._temp: Optional[tempfile.TemporaryDirectory] = None
         self._member_cache: Dict[str, Dict[str, str]] = {}
         self._member_cache_time: Dict[str, float] = {}
@@ -292,11 +293,12 @@ class WeChat4Reader:
                 )
                 self.account = account
                 info = self.db.get_self_info()
+                self._self_username = str(info.get("username") or self.db.wxid)
                 if not self.db._keys:
                     raise RuntimeError("未能从微信进程取得数据库解密信息，请确认微信已登录并允许读取进程")
                 return {
                     "account": account,
-                    "wxid": self.db.wxid,
+                    "wxid": self._self_username,
                     "nickname": info.get("nick_name") or info.get("remark") or self.db.wxid,
                     "unavailable_databases": len(self.db.unkeyed),
                 }
@@ -311,6 +313,7 @@ class WeChat4Reader:
                 self.db.master_key = None
                 self.db = None
             self.account = ""
+            self._self_username = ""
             self._member_cache.clear()
             self._member_cache_time.clear()
             gc.collect()
@@ -370,7 +373,7 @@ class WeChat4Reader:
         if members is None:
             members = self._members(group_id)
         if row.get("is_self") or row.get("sender_id") in (2, "2", 3, "3"):
-            sender_id = db.wxid
+            sender_id = self._self_username or db.get_self_info().get("username") or db.wxid
             sender = members.get(sender_id)
             if not sender:
                 info = db.get_self_info()

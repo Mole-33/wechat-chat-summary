@@ -8,8 +8,8 @@ from pathlib import Path
 
 
 APP_NAME = "微信群聊 AI 总结助手"
-APP_VERSION = "0.1.6"
-GITHUB_REPOSITORY = "Mole-33/-"
+APP_VERSION = "0.1.7"
+GITHUB_REPOSITORY = "Mole-33/wechat-chat-summary"
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent

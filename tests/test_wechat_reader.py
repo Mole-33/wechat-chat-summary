@@ -78,6 +78,119 @@ class RangeQueryTests(unittest.TestCase):
         self.assertEqual(members[0]["display_name"], "群内 Alice")
         self.assertTrue(members[0]["is_owner"])
 
+    def test_group_listing_tolerates_missing_owner_and_member_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contact.db")
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                "CREATE TABLE chat_room(id INTEGER, username TEXT, ext_buffer BLOB);"
+                "CREATE TABLE contact(id INTEGER, username TEXT, nick_name TEXT, remark TEXT);"
+            )
+            ext_buffer = _chatroom_member_record("wxid_alice", "群内 Alice")
+            conn.execute("INSERT INTO chat_room VALUES(1, 'room@chatroom', ?)", (ext_buffer,))
+            conn.execute("INSERT INTO contact VALUES(1, 'room@chatroom', '兼容群聊', '')")
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+            db._db_files = []
+
+            def contact_conn():
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._contact_conn = contact_conn
+            groups = db.get_groups()
+            members = db.get_group_members("room@chatroom")
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["name"], "兼容群聊")
+        self.assertEqual(groups[0]["owner"], "")
+        self.assertEqual(members[0]["username"], "wxid_alice")
+        self.assertEqual(members[0]["display_name"], "群内 Alice")
+
+    def test_group_listing_falls_back_to_contact_rows_without_chat_room(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contact.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE contact(id INTEGER, username TEXT, nick_name TEXT, remark TEXT)"
+            )
+            conn.execute("INSERT INTO contact VALUES(1, 'fallback@chatroom', '备用群名', '')")
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+            db._db_files = []
+
+            def contact_conn():
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._contact_conn = contact_conn
+            groups = db.get_groups()
+
+        self.assertEqual(groups[0]["username"], "fallback@chatroom")
+        self.assertEqual(groups[0]["name"], "备用群名")
+
+    def test_group_listing_falls_back_to_session_when_contact_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "session.db")
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE SessionTable(username TEXT)")
+            conn.executemany(
+                "INSERT INTO SessionTable VALUES(?)",
+                [("session-room@chatroom",), ("filehelper",)],
+            )
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+            db._db_files = [("session.db", path, os.path.getsize(path))]
+            db._contact_conn = lambda: None
+
+            def open_db(_rel):
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._open = open_db
+            groups = db.get_groups()
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["username"], "session-room@chatroom")
+        self.assertEqual(groups[0]["name"], "session-room@chatroom")
+
+    def test_self_info_resolves_account_directory_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contact.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE contact(username TEXT, alias TEXT, nick_name TEXT, remark TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO contact VALUES('wxid_internal', 'friendly_name', '账号昵称', '')"
+            )
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+            db.account = "friendly_name_abcd"
+            db._db_files = [("contact.db", path, os.path.getsize(path))]
+
+            def open_db(_rel):
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._open = open_db
+            info = db.get_self_info()
+
+        self.assertEqual(info["username"], "wxid_internal")
+        self.assertEqual(info["nick_name"], "账号昵称")
+
     def test_reader_prefers_group_name_for_members_and_self(self):
         class FakeDB:
             wxid = "wxid_self"
