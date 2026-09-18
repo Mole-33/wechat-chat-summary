@@ -1823,7 +1823,7 @@ class WeChatDB:
         if not rows:
             return []
         rows.sort(key=lambda r: r["sort_seq"], reverse=True)
-        return [self._msg_row_to_dict(r) for r in rows[offset:offset + limit]]
+        return self._msg_rows_to_dicts(rows[offset:offset + limit], user)
 
     def get_messages_in_range(
         self, user: str, start_ts: int, end_ts: int,
@@ -1882,7 +1882,7 @@ class WeChatDB:
         if not rows:
             return []
         rows.sort(key=lambda r: (r["create_time"], r["sort_seq"], r["local_id"]))
-        return [self._msg_row_to_dict(r) for r in rows[:cap]]
+        return self._msg_rows_to_dicts(rows[:cap], user)
 
     def get_message_rows_for_media(self, user: str, local_id: int) -> List[dict]:
         """返回跨分片 local_id 命中的全部消息行（供媒体分发判定类型）。
@@ -2001,9 +2001,65 @@ class WeChatDB:
         if not rows:
             return []
         rows.sort(key=lambda r: r["sort_seq"])
-        return [self._msg_row_to_dict(r) for r in rows[:want]]
+        return self._msg_rows_to_dicts(rows[:want], user)
 
-    def _msg_row_to_dict(self, r) -> dict:
+    def _msg_rows_to_dicts(self, rows, user: str = "") -> List[dict]:
+        """Convert rows and learn a sender map scoped to one group.
+
+        A small number of live WeChat snapshots can omit the embedded sender
+        prefix from individual rows. A numeric sender id is only reused after
+        another row in the *same group* has authoritatively linked it to a
+        username. Conflicting links are deliberately left unresolved.
+        """
+        converted = [self._msg_row_to_dict(row, user) for row in rows]
+        if not str(user or "").endswith("@chatroom"):
+            return converted
+
+        all_caches = getattr(self, "_group_sender_id_cache", None)
+        if all_caches is None:
+            all_caches = {}
+            self._group_sender_id_cache = all_caches
+        sender_cache = all_caches.setdefault(str(user), {})
+
+        for item in converted:
+            if item.get("is_self") or not item.get("sender_username"):
+                continue
+            sender_id = str(item.get("sender_id") or "")
+            username = str(item["sender_username"])
+            if not sender_id:
+                continue
+            existing = sender_cache.get(sender_id)
+            if existing is None and sender_id in sender_cache:
+                continue
+            if existing and existing != username:
+                sender_cache[sender_id] = None
+            else:
+                sender_cache[sender_id] = username
+
+        for item in converted:
+            if item.get("is_self") or item.get("sender_username"):
+                continue
+            learned = sender_cache.get(str(item.get("sender_id") or ""))
+            if learned:
+                item["sender_username"] = learned
+        return converted
+
+    @staticmethod
+    def _split_group_sender_prefix(content: str) -> Tuple[str, str]:
+        """Split ``username:\nbody`` used by incoming WeChat 4.x group text.
+
+        ``real_sender_id`` is not a stable rowid into SenderName2Id on current
+        WeChat 4.x builds. The username embedded by WeChat in group message
+        content is the authoritative sender identity.
+        """
+        if not isinstance(content, str):
+            return "", content
+        match = re.match(r"^([A-Za-z0-9_@.\-]{3,128}):\r?\n", content)
+        if not match:
+            return "", content
+        return match.group(1), content[match.end():]
+
+    def _msg_row_to_dict(self, r, user: str = "") -> dict:
         content = r["message_content"]
         mtype = WeChatDB._msg_type_name(r["local_type"])
         if isinstance(content, bytes):
@@ -2023,7 +2079,15 @@ class WeChatDB:
                     content = cc_text
         sender_id = r["real_sender_id"]
         sender_username = ""
-        if sender_id and sender_id != 2:
+        is_group = str(user or "").endswith("@chatroom")
+        # Current WeChat 4.x databases use 3 for outgoing group messages;
+        # older supported layouts used 2. Incoming group messages carry an
+        # authoritative ``username:\n`` prefix in their body.
+        is_self = is_group and sender_id in (2, "2", 3, "3")
+        if is_group:
+            if not is_self:
+                sender_username, content = self._split_group_sender_prefix(content)
+        elif sender_id and sender_id not in (2, "2"):
             sender_index = self._sender_id_index()
             sender_username = sender_index.get(int(sender_id), "")
         return {
@@ -2031,6 +2095,7 @@ class WeChatDB:
             "type": mtype,
             "sender_id": sender_id,
             "sender_username": sender_username,
+            "is_self": is_self,
             "create_time": r["create_time"],
             "content": content,
             "sort_seq": r["sort_seq"],
@@ -2370,7 +2435,11 @@ class WeChatDB:
         return idx
 
     def _sender_id_index(self) -> Dict[int, str]:
-        """消息表 real_sender_id(数字) → 用户名，来自 message_resource.SenderName2Id"""
+        """Legacy non-group sender index from message_resource.SenderName2Id.
+
+        Current WeChat 4.x group ``real_sender_id`` values are not stable table
+        rowids; group messages must use their embedded ``username:\n`` prefix.
+        """
         if hasattr(self, '_sender_id_cache') and self._sender_id_cache is not None:
             return self._sender_id_cache
         idx: Dict[int, str] = {}

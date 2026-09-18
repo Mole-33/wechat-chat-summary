@@ -211,6 +211,100 @@ class RangeQueryTests(unittest.TestCase):
                 conn.close()
         self.assertEqual([row["content"] for row in rows], ["earlier", "later"])
 
+    def test_group_message_prefix_overrides_wrong_numeric_sender_mapping(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE Msg_test(local_id INT, local_type INT, real_sender_id INT, "
+            "create_time INT, message_content TEXT, source BLOB, packed_info_data BLOB, "
+            "compress_content BLOB, server_id INT, sort_seq INT)"
+        )
+        conn.execute("CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq)")
+        conn.execute(
+            "INSERT INTO Msg_test VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (1, 1, 227, 1789689600, "wxid_alice:\n真正内容", None, None, None, 1, 1789689600000),
+        )
+        db = WeChatDB.__new__(WeChatDB)
+        db._run_msg_query = lambda _user, build: build([(conn, "Msg_test")])
+        db._sender_id_index = lambda: {227: "wxid_wrong"}
+        try:
+            rows = db.get_messages_in_range(
+                "room@chatroom", 1789689500, 1789689700, text_only=True,
+            )
+        finally:
+            conn.close()
+        self.assertEqual(rows[0]["sender_username"], "wxid_alice")
+        self.assertEqual(rows[0]["content"], "真正内容")
+
+    def test_group_batch_recovers_missing_prefix_from_same_group_sender(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE Msg_test(local_id INT, local_type INT, real_sender_id INT, "
+            "create_time INT, message_content TEXT, source BLOB, packed_info_data BLOB, "
+            "compress_content BLOB, server_id INT, sort_seq INT)"
+        )
+        conn.execute("CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq)")
+        conn.executemany(
+            "INSERT INTO Msg_test VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [
+                (1, 1, 105, 1789689600, "偶发无前缀内容", None, None, None, 1, 1789689600000),
+                (2, 1, 105, 1789689601, "q27420189:\n正常内容", None, None, None, 2, 1789689601000),
+            ],
+        )
+        db = WeChatDB.__new__(WeChatDB)
+        db._run_msg_query = lambda _user, build: build([(conn, "Msg_test")])
+        try:
+            rows = db.get_messages_in_range(
+                "room@chatroom", 1789689500, 1789689700, text_only=True,
+            )
+        finally:
+            conn.close()
+        self.assertEqual([row["sender_username"] for row in rows], ["q27420189", "q27420189"])
+        self.assertEqual(rows[0]["content"], "偶发无前缀内容")
+
+    def test_group_message_without_prefix_never_uses_wrong_numeric_index(self):
+        row = {
+            "local_id": 1, "local_type": 1, "real_sender_id": 227,
+            "create_time": 1789689600, "message_content": "无前缀内容",
+            "compress_content": None, "server_id": 1, "sort_seq": 1,
+        }
+        db = WeChatDB.__new__(WeChatDB)
+        db._sender_id_index = lambda: {227: "wxid_wrong"}
+        converted = db._msg_row_to_dict(row, "room@chatroom")
+        self.assertEqual(converted["sender_username"], "")
+        self.assertEqual(converted["content"], "无前缀内容")
+        self.assertFalse(converted["is_self"])
+
+    def test_current_wechat_group_sender_three_is_self(self):
+        row = {
+            "local_id": 1, "local_type": 1, "real_sender_id": 3,
+            "create_time": 1789689600, "message_content": "本人消息",
+            "compress_content": None, "server_id": 1, "sort_seq": 1,
+        }
+        db = WeChatDB.__new__(WeChatDB)
+        converted = db._msg_row_to_dict(row, "room@chatroom")
+        self.assertTrue(converted["is_self"])
+        self.assertEqual(converted["sender_username"], "")
+
+        class FakeDB:
+            wxid = "wxid_self"
+
+            def get_group_members(self, _group_id):
+                return [{
+                    "username": "wxid_self", "display_name": "我的群昵称",
+                    "remark": "通讯录备注", "nick_name": "微信昵称",
+                }]
+
+            def get_self_info(self):
+                return {"remark": "通讯录备注", "nick_name": "微信昵称"}
+
+        reader = WeChat4Reader()
+        reader.db = FakeDB()
+        message = reader._convert("room@chatroom", "群", converted)
+        self.assertEqual(message.sender_nickname, "我的群昵称")
+        self.assertEqual(message.sender_id, "wxid_self")
+
     def test_reader_uses_single_range_query_and_reports_progress(self):
         class FakeDB:
             wxid = "self"

@@ -369,7 +369,7 @@ class WeChat4Reader:
         db = self._require_db()
         if members is None:
             members = self._members(group_id)
-        if row.get("sender_id") == 2:
+        if row.get("is_self") or row.get("sender_id") in (2, "2", 3, "3"):
             sender_id = db.wxid
             sender = members.get(sender_id)
             if not sender:
