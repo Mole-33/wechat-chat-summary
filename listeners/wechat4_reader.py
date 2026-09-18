@@ -63,17 +63,25 @@ class EphemeralWeChatDB(WeChatDB):
             self._keys.update(self.derive_keys_from_master(master_key))
             self.master_key = master_key
         else:
-            self._keys.update(self.extract_keys())
             try:
-                derived = self.extract_master_key()
+                cfg_info = self.extract_master_key()
             except Exception:
-                derived = None
-            if derived:
-                master, cfg_dword, _ = derived
+                cfg_info = None
+            if cfg_info:
+                master, cfg_dword, current_wxid = cfg_info
+                if current_wxid and current_wxid != self.wxid:
+                    raise RuntimeError(
+                        f"当前微信进程登录的是 {current_wxid}，请选择对应的账号目录"
+                    )
                 self.cfg_dword = cfg_dword
-                if not self._keys:
+            # 微信 4.1.13+ 的 cfg 密钥字段已不能可靠派生数据库密钥；
+            # Config.Cipher 扫描结果经过每个数据库页 1 的 HMAC 校验，作为主路径。
+            self._keys.update(self.extract_keys())
+            if not self._keys and cfg_info:
+                derived = self.derive_keys_from_master(master)
+                if derived:
                     self.master_key = master
-                    self._keys.update(self.derive_keys_from_master(master))
+                    self._keys.update(derived)
         self.unkeyed = [
             rel for rel, _, _ in self._db_files
             if rel not in self._keys or not self._key_works(rel)
@@ -86,32 +94,115 @@ class EphemeralWeChatDB(WeChatDB):
         while we copy it. The encrypted main database is still a valid historical
         snapshot. Falling back keeps reads available without touching WeChat.
         """
-        last_error = None
-        for _ in range(1):
+        def source_generation():
+            src = self._db_path(rel)
+            src_stat = os.stat(src)
+            wal = self._wal_path(rel)
+            if not wal:
+                return (src_stat.st_mtime_ns, src_stat.st_size, 0, 0, b"")
+            wal_stat = os.stat(wal)
             try:
-                return super()._open(rel)
+                with open(wal, "rb") as handle:
+                    salt = handle.read(24)[16:24]
+            except OSError:
+                salt = b""
+            return (
+                src_stat.st_mtime_ns, src_stat.st_size,
+                wal_stat.st_mtime_ns, wal_stat.st_size, salt,
+            )
+
+        def generation_is_compatible(before, after):
+            main_unchanged = before[:2] == after[:2]
+            before_wal_size, after_wal_size = before[3], after[3]
+            same_wal_generation = before[4] == after[4]
+            return main_unchanged and same_wal_generation and after_wal_size >= before_wal_size
+
+        def discard_rel_cache():
+            dst = os.path.join(self.workdir, rel.replace(os.sep, "__"))
+            for suffix in ("", ".stamp", "-wal", "-shm"):
+                try:
+                    os.remove(dst + suffix)
+                except OSError:
+                    pass
+
+        last_error = None
+        src = self._db_path(rel)
+        dst = os.path.join(self.workdir, rel.replace(os.sep, "__"))
+        stamp = dst + ".stamp"
+        is_large = os.path.getsize(src) > 64 * 1024 * 1024
+
+        # 大型库首次打开或源文件已变化时，直接走下方的一致性快照路径。
+        # 避免先对活跃库完整解密数次，又因 checkpoint 世代变化全部丢弃。
+        cache_current = False
+        if is_large and os.path.exists(dst) and os.path.exists(stamp):
+            try:
+                parts = Path(stamp).read_text(encoding="ascii").split(",")
+                current = source_generation()
+                cache_current = (
+                    int(parts[0]) == STAMP_VERSION
+                    and float(parts[1]) == os.path.getmtime(src)
+                    and int(parts[2]) == os.path.getsize(src)
+                    and int(parts[4]) <= current[3]
+                    and parts[6] == current[4].hex()
+                )
+            except (OSError, ValueError, IndexError):
+                cache_current = False
+
+        attempts = 1 if (not is_large or cache_current) else 0
+        for _ in range(attempts):
+            before = source_generation()
+            try:
+                conn = super()._open(rel)
             except RuntimeError as exc:
                 last_error = exc
                 time.sleep(0.25)
+                continue
+            after = source_generation()
+            if generation_is_compatible(before, after):
+                return conn
+            conn.close()
+            discard_rel_cache()
+            last_error = RuntimeError(f"数据库正在 checkpoint，已自动重试: {rel}")
+            time.sleep(0.15)
+        if last_error is None:
+            last_error = RuntimeError(f"正在创建数据库一致性快照: {rel}")
         if rel not in self._keys:
             raise last_error
-        src = self._db_path(rel)
-        dst = os.path.join(self.workdir, rel.replace(os.sep, "__"))
         wal_path = self._wal_path(rel)
         snap_db = dst + ".encrypted-snapshot"
         snap_wal = snap_db + "-wal"
         if wal_path:
             for _ in range(3):
                 try:
+                    main_before = os.stat(src)
+                    wal_stat_before = os.stat(wal_path)
+                    with open(wal_path, "rb") as handle:
+                        wal_salt_before = handle.read(24)[16:24]
                     shutil.copyfile(src, snap_db)
                     shutil.copyfile(wal_path, snap_wal)
+                    main_after = os.stat(src)
+                    with open(wal_path, "rb") as handle:
+                        wal_salt_after = handle.read(24)[16:24]
+                    snap_wal_size = os.path.getsize(snap_wal)
+                    if (
+                        (main_before.st_mtime_ns, main_before.st_size)
+                        != (main_after.st_mtime_ns, main_after.st_size)
+                        or wal_salt_before != wal_salt_after
+                        or snap_wal_size < self.WAL_HEADER_SZ
+                        or (snap_wal_size - self.WAL_HEADER_SZ) % self.WAL_FRAME_SZ
+                    ):
+                        time.sleep(0.15)
+                        continue
                     self._decrypt_file(snap_db, dst, self._keys[rel])
-                    self._merge_wal(dst, snap_wal, self._keys[rel], 0)
+                    applied = self._merge_wal(dst, snap_wal, self._keys[rel], 0)
                     if self._check_merged(dst):
-                        src_mtime, src_size = os.path.getmtime(src), os.path.getsize(src)
-                        wal_mtime, wal_size = os.path.getmtime(wal_path), os.path.getsize(wal_path)
+                        src_mtime, src_size = main_before.st_mtime, main_before.st_size
+                        wal_mtime, wal_size = wal_stat_before.st_mtime, snap_wal_size
                         with open(dst + ".stamp", "w", encoding="ascii") as stamp:
-                            stamp.write(f"{STAMP_VERSION},{src_mtime!r},{src_size},{wal_mtime!r},{wal_size},0")
+                            stamp.write(
+                                f"{STAMP_VERSION},{src_mtime!r},{src_size},"
+                                f"{wal_mtime!r},{wal_size},{applied},{wal_salt_after.hex()}"
+                            )
                         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
                         conn.row_factory = sqlite3.Row
                         conn.text_factory = _sqlite_text_factory
@@ -128,11 +219,23 @@ class EphemeralWeChatDB(WeChatDB):
         self._decrypt_file(src, dst, self._keys[rel])
         if not self._check_merged(dst):
             raise last_error
-        src_mtime, src_size = os.path.getmtime(src), os.path.getsize(src)
-        wal_mtime = os.path.getmtime(wal_path) if wal_path else 0.0
-        wal_size = os.path.getsize(wal_path) if wal_path else 0
+        src_stat = os.stat(src)
+        src_mtime, src_size = src_stat.st_mtime, src_stat.st_size
+        wal_mtime, wal_size, wal_salt = 0.0, 0, ""
+        if wal_path:
+            try:
+                wal_stat = os.stat(wal_path)
+                with open(wal_path, "rb") as handle:
+                    wal_salt = handle.read(24)[16:24].hex()
+                wal_mtime, wal_size = wal_stat.st_mtime, wal_stat.st_size
+            except OSError:
+                # WeChat may checkpoint and remove the WAL between retries.
+                wal_mtime, wal_size, wal_salt = 0.0, 0, ""
         with open(dst + ".stamp", "w", encoding="ascii") as stamp:
-            stamp.write(f"{STAMP_VERSION},{src_mtime!r},{src_size},{wal_mtime!r},{wal_size},0")
+            stamp.write(
+                f"{STAMP_VERSION},{src_mtime!r},{src_size},"
+                f"{wal_mtime!r},{wal_size},0,{wal_salt}"
+            )
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _sqlite_text_factory
@@ -257,7 +360,12 @@ class WeChat4Reader:
             sender_id = row.get("sender_username") or str(row.get("sender_id") or "")
             sender = self._members(group_id).get(sender_id)
             if not sender:
-                sender = db.get_nickname(sender_id) if sender_id else "未知成员"
+                # 纯数字 sender_id 是 message_resource 的内部 rowid，不是微信号；
+                # 映射缺失时避免为每条消息重复打开 contact.db 做无效查询。
+                sender = (
+                    db.get_nickname(sender_id)
+                    if sender_id and not sender_id.isdigit() else "未知成员"
+                )
         return ChatMessage(
             id=int(row.get("sort_seq") or row.get("local_id") or 0),
             timestamp=datetime.fromtimestamp(int(row.get("create_time") or 0)),
@@ -277,34 +385,30 @@ class WeChat4Reader:
         text_only: bool = True,
         page_size: int = 500,
         max_messages: int = 250_000,
+        progress: Optional[Callable[[int, str], None]] = None,
     ) -> List[ChatMessage]:
         if end < start:
             raise ValueError("结束时间不能早于开始时间")
         db = self._require_db()
         start_ts, end_ts = int(start.timestamp()), int(end.timestamp())
-        offset = 0
+        if progress:
+            progress(5, "正在打开并校验微信消息数据库")
+        rows = db.get_messages_in_range(
+            group_id, start_ts, end_ts,
+            text_only=text_only, max_rows=max_messages + 1,
+        )
+        if len(rows) > max_messages:
+            rows.clear()
+            raise RuntimeError("所选范围超过 25 万条文字消息，请缩短时间范围")
+        if progress:
+            progress(70, f"已定位 {len(rows)} 条文字消息，正在解析群成员")
         messages: List[ChatMessage] = []
-        reached_start = False
-        while not reached_start:
-            rows = db.get_messages(group_id, limit=page_size, offset=offset)
-            if not rows:
-                break
-            for row in rows:
-                timestamp = int(row.get("create_time") or 0)
-                if timestamp > end_ts:
-                    continue
-                if timestamp < start_ts:
-                    reached_start = True
-                    continue
-                if text_only and row.get("type") != "文本":
-                    continue
-                messages.append(self._convert(group_id, group_name, row))
-                if len(messages) > max_messages:
-                    raise RuntimeError("所选范围超过 25 万条文字消息，请缩短时间范围")
-            offset += len(rows)
-            if len(rows) < page_size:
-                break
-        messages.sort(key=lambda item: (item.timestamp, item.id or 0))
+        total = max(len(rows), 1)
+        for index, row in enumerate(rows, 1):
+            messages.append(self._convert(group_id, group_name, row))
+            if progress and (index == total or index % 1000 == 0):
+                progress(70 + round(index / total * 30), f"正在解析聊天记录 {index}/{len(rows)}")
+        rows.clear()
         return messages
 
     def latest_sequence(self, group_id: str) -> int:

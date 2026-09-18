@@ -24,7 +24,7 @@ from core.reporter import ReportGenerator
 from core.secure_settings import SettingsStore
 from core.stats_engine import StatsEngine
 from core.storage import StorageManager
-from core.summarizer import estimate_work, summarize_messages, summary_to_markdown
+from core.summarizer import summarize_messages, summary_to_markdown
 from core.updater import UpdateManager
 from listeners.wechat4_reader import WeChat4Reader
 
@@ -230,27 +230,11 @@ class GUIStateManager:
             proxy_password=profile.get("proxy_password", ""),
         )
 
-    def estimate_summary(self, group_ids: List[str], start: datetime, end: datetime) -> Dict[str, Any]:
-        if not self.reader.connected:
-            raise RuntimeError("请先连接微信账号")
-        estimates = []
-        totals = {"message_count": 0, "estimated_input_tokens": 0, "estimated_calls": 0}
-        for group_id in group_ids:
-            group = self._group(group_id)
-            with self._db_lock:
-                messages = self.reader.read_range(group_id, group["name"], start, end)
-            item = estimate_work(messages)
-            item.update({"group_id": group_id, "group_name": group["name"]})
-            estimates.append(item)
-            for key in totals:
-                totals[key] += item[key]
-            messages.clear()
-        return {"groups": estimates, "totals": totals}
-
     def start_summary_job(
         self, group_ids: List[str], start: datetime, end: datetime,
         provider_id: str, automatic: bool = False,
     ) -> str:
+        group_ids = list(dict.fromkeys(group_ids))
         if not group_ids:
             raise ValueError("请至少选择一个群聊")
         if not self.reader.connected:
@@ -259,7 +243,7 @@ class GUIStateManager:
         job_id = uuid.uuid4().hex
         self.summary_jobs[job_id] = {
             "id": job_id, "status": "queued", "progress": 0,
-            "message": "等待开始", "results": {}, "errors": {},
+            "message": "任务已创建，准备读取聊天记录", "results": {}, "errors": {},
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "automatic": automatic,
         }
@@ -269,21 +253,36 @@ class GUIStateManager:
             job["status"] = "running"
             completed = 0
             for group_id in group_ids:
-                group = self._group(group_id)
+                messages = []
                 try:
-                    job["message"] = f"正在读取【{group['name']}】"
+                    group = self._group(group_id)
+                    group_number = completed + 1
+                    group_total = len(group_ids)
+                    job["progress"] = round(completed / group_total * 100)
+                    job["message"] = f"正在读取【{group['name']}】聊天记录（{group_number}/{group_total} 群）"
+
+                    def read_progress(percent, text):
+                        group_base = completed / group_total
+                        read_part = max(0, min(percent / 100, 1)) * 0.25 / group_total
+                        job["progress"] = round((group_base + read_part) * 100)
+                        job["message"] = f"【{group['name']}】{text}（{group_number}/{group_total} 群）"
+
                     with self._db_lock:
-                        messages = self.reader.read_range(group_id, group["name"], start, end)
+                        messages = self.reader.read_range(
+                            group_id, group["name"], start, end, progress=read_progress,
+                        )
+                    job["progress"] = round((completed + 0.25) / group_total * 100)
+                    job["message"] = f"【{group['name']}】已读取 {len(messages)} 条，准备调用 AI"
                     client = self._client(provider_id)
 
                     def progress(call_index, total_calls, text):
                         group_base = completed / len(group_ids)
-                        group_part = (call_index - 1) / max(total_calls, 1) / len(group_ids)
+                        call_ratio = max(0, min(call_index / max(total_calls, 1), 1))
+                        group_part = (0.25 + call_ratio * 0.70) / len(group_ids)
                         job["progress"] = round((group_base + group_part) * 100)
-                        job["message"] = f"【{group['name']}】{text}"
+                        job["message"] = f"【{group['name']}】{text}（{group_number}/{group_total} 群）"
 
                     result = summarize_messages(client, group["name"], start, end, messages, progress)
-                    messages.clear()
                     job["results"][group_id] = {
                         "summary": result,
                         "markdown": summary_to_markdown(result),
@@ -292,6 +291,8 @@ class GUIStateManager:
                         self.storage.set_meta(f"last_summary_success:{group_id}", end.isoformat())
                 except Exception as exc:
                     job["errors"][group_id] = str(exc)
+                finally:
+                    messages.clear()
                 completed += 1
                 job["progress"] = round(completed / len(group_ids) * 100)
             job["status"] = "completed" if job["results"] else "failed"
@@ -495,17 +496,11 @@ class AppHTTPRequestHandler(BaseHTTPRequestHandler):
                     return self._json(checked)
                 staged = state.updater.stage(checked["asset"])
                 return self._json({"success": True, "path": str(staged), "message": "更新包已验证并下载；退出应用后解压覆盖即可，当前版本可作为回滚副本"})
-            if path == "/api/summary/estimate":
+            if path == "/api/summary/run":
                 start = _parse_datetime(payload.get("start"), "开始时间")
                 end = _parse_datetime(payload.get("end"), "结束时间")
                 if end <= start:
                     raise ValueError("结束时间必须晚于开始时间")
-                return self._json(state.estimate_summary(payload.get("group_ids") or [], start, end))
-            if path == "/api/summary/run":
-                if payload.get("confirmed") is not True:
-                    raise ValueError("必须先确认消息量与预计调用次数")
-                start = _parse_datetime(payload.get("start"), "开始时间")
-                end = _parse_datetime(payload.get("end"), "结束时间")
                 job_id = state.start_summary_job(
                     payload.get("group_ids") or [], start, end,
                     str(payload.get("provider_id") or ""), automatic=False,

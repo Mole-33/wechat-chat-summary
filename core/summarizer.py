@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -62,19 +61,6 @@ def chunk_messages(messages: Iterable[ChatMessage], limit: int = CHUNK_TOKEN_LIM
     return chunks
 
 
-def estimate_work(messages: List[ChatMessage]) -> Dict[str, int]:
-    formatted = "\n".join(format_message(message) for message in messages)
-    input_tokens = estimate_tokens(formatted)
-    chunks = max(1, math.ceil(input_tokens / CHUNK_TOKEN_LIMIT)) if messages else 0
-    calls = chunks + (1 if chunks > 1 else 0)
-    return {
-        "message_count": len(messages),
-        "estimated_input_tokens": input_tokens,
-        "estimated_calls": calls,
-        "chunk_count": chunks,
-    }
-
-
 def _parse_json(content: str) -> Dict:
     text = content.strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
@@ -121,18 +107,20 @@ def summarize_messages(
     for index, chunk in enumerate(chunks, 1):
         call_index += 1
         if progress:
-            progress(call_index, total_calls, f"正在总结第 {index}/{len(chunks)} 段")
+            progress(call_index - 1, total_calls, f"正在调用 AI 总结第 {index}/{len(chunks)} 段")
         prompt = (
             f"群聊：{group_name}\n时间范围：{start:%Y-%m-%d %H:%M:%S} 至 {end:%Y-%m-%d %H:%M:%S}\n"
             f"这是第 {index}/{len(chunks)} 段消息。\n{SCHEMA_INSTRUCTION}\n\n消息：\n{chunk}"
         )
         partials.append(_parse_json(client.chat(SYSTEM_PROMPT, prompt)["content"]))
+        if progress:
+            progress(call_index, total_calls, f"已完成第 {index}/{len(chunks)} 段")
     if len(partials) == 1:
         result = partials[0]
     else:
         call_index += 1
         if progress:
-            progress(call_index, total_calls, "正在合并分段总结")
+            progress(call_index - 1, total_calls, "正在调用 AI 合并分段总结")
         merge_prompt = (
             f"请将以下 {len(partials)} 份分段结果合并为一份去重后的群聊总结。"
             "不得新增分段结果中不存在的事实，保留原文依据。\n"
@@ -140,6 +128,8 @@ def summarize_messages(
             f"{SCHEMA_INSTRUCTION}\n\n分段结果：\n{json.dumps(partials, ensure_ascii=False)}"
         )
         result = _parse_json(client.chat(SYSTEM_PROMPT, merge_prompt)["content"])
+        if progress:
+            progress(call_index, total_calls, "分段总结合并完成")
     result["group_name"] = group_name
     result["start"] = start.isoformat(sep=" ", timespec="seconds")
     result["end"] = end.isoformat(sep=" ", timespec="seconds")
@@ -182,4 +172,3 @@ def summary_to_markdown(summary: Dict) -> str:
             evidence = evidence_text(item.get("evidence", [])) if isinstance(item, dict) else ""
             lines.append(f"- {line}" + (f"\n  - 依据：{evidence}" if evidence else ""))
     return "\n".join(lines).strip() + "\n"
-

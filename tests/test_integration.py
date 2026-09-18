@@ -22,8 +22,8 @@ def test_authorized_group_range_can_be_read_without_logging_content():
             datetime.combine(today, time(0, 0)),
             datetime.combine(today, time(13, 0)),
         )
-        assert isinstance(messages, list)
+        assert messages, "授权时段内应至少读取到一条文字消息，不能把空列表误判为成功"
+        assert all(datetime.combine(today, time(0, 0)) <= item.timestamp <= datetime.combine(today, time(13, 0)) for item in messages)
         messages.clear()
     finally:
         reader.close()
-

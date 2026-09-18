@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import ctypes
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import hashlib
 import hmac as hmac_mod
@@ -41,7 +43,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
-STAMP_VERSION = 3  # v3: stamp 内 mtime 改用 %r 完整精度（%f 只留 6 位小数，与 Windows 7 位小数比较恒不等→每秒重建缓存→磁盘 50MB/s 读+写）
+STAMP_VERSION = 4  # v4: 记录 WAL salt，安全区分 checkpoint 前后的 WAL 世代
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -1128,31 +1130,39 @@ class WeChatDB:
 
     @staticmethod
     def _find_bytes(h, read, needle: bytes) -> List[int]:
-        hits = []
-        addr = 0
-        while True:
-            mbi = _MBI()
-            r = _k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
-            if r == 0:
-                break
-            if (
-                mbi.State == 0x1000
-                and (mbi.Protect & 0xFF) & 0xE6
-                and not (mbi.Protect & 0x100)
-                and 0 < mbi.RegionSize < 0x10000000
-            ):
-                buf = read(mbi.BaseAddress or 0, mbi.RegionSize)
-                if buf:
-                    base = mbi.BaseAddress or 0
-                    pos = 0
-                    while True:
-                        pos = buf.find(needle, pos)
-                        if pos < 0:
-                            break
-                        hits.append(base + pos)
-                        pos += 1
-            addr = (mbi.BaseAddress or 0) + mbi.RegionSize
-        return hits
+        def scan(private_only: bool) -> List[int]:
+            hits = []
+            addr = 0
+            while True:
+                mbi = _MBI()
+                r = _k32.VirtualQueryEx(
+                    h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi),
+                )
+                if r == 0:
+                    break
+                if (
+                    mbi.State == 0x1000
+                    and (not private_only or mbi.Type == 0x20000)  # MEM_PRIVATE
+                    and (mbi.Protect & 0xFF) & 0xE6
+                    and not (mbi.Protect & 0x100)
+                    and 0 < mbi.RegionSize < 0x10000000
+                ):
+                    buf = read(mbi.BaseAddress or 0, mbi.RegionSize)
+                    if buf:
+                        base = mbi.BaseAddress or 0
+                        pos = 0
+                        while True:
+                            pos = buf.find(needle, pos)
+                            if pos < 0:
+                                break
+                            hits.append(base + pos)
+                            pos += 1
+                addr = (mbi.BaseAddress or 0) + mbi.RegionSize
+            return hits
+
+        # Config.Cipher 对象及引用位于进程私有堆。优先跳过庞大的 DLL 映像和
+        # 数据库映射；极少数版本若私有区未命中，再回退原来的全区域扫描。
+        return scan(private_only=True) or scan(private_only=False)
 
     def _stable_key_dirs(self) -> List[str]:
         """稳定密钥副本目录（不随 TEMP 清理而丢失）。
@@ -1317,6 +1327,13 @@ class WeChatDB:
         wal_path = self._wal_path(rel)
         wal_mtime = os.path.getmtime(wal_path) if wal_path else 0.0
         wal_size = os.path.getsize(wal_path) if wal_path else 0
+        wal_salt = ""
+        if wal_path:
+            try:
+                with open(wal_path, "rb") as wal_handle:
+                    wal_salt = wal_handle.read(24)[16:24].hex()
+            except OSError:
+                wal_salt = ""
         stamp = dst + ".stamp"
         old = None
         if os.path.exists(stamp):
@@ -1330,18 +1347,21 @@ class WeChatDB:
                     "wal_mtime": float(parts[3]),
                     "wal_size": int(parts[4]),
                     "applied": int(parts[5]),
+                    "wal_salt": parts[6],
                 }
                 if old["ver"] != STAMP_VERSION:
                     old = None
             except (ValueError, OSError, IndexError):
                 old = None
         build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                 or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
+                 or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size
+                 or old["wal_salt"] != wal_salt)
         attempt = 0
         while build:
             attempt += 1
             full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                    or wal_size < old["wal_size"] or wal_size == 0)
+                    or wal_size < old["wal_size"] or wal_size == 0
+                    or old["wal_salt"] != wal_salt)
             if full:
                 self._decrypt_file(src, dst, key)
                 applied = 0
@@ -1355,8 +1375,9 @@ class WeChatDB:
                 build = False
                 os.makedirs(os.path.dirname(stamp), exist_ok=True)
                 with open(stamp, "w") as f:
-                    f.write("%d,%r,%d,%r,%d,%d"
-                            % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
+                    f.write("%d,%r,%d,%r,%d,%d,%s"
+                            % (STAMP_VERSION, src_mtime, src_size, wal_mtime,
+                               wal_size, applied, wal_salt))
             elif attempt >= 3:
                 raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
             else:
@@ -1378,7 +1399,14 @@ class WeChatDB:
         try:
             conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
             try:
-                rows = conn.execute("PRAGMA quick_check").fetchall()
+                # 大型消息库逐页 quick_check 会额外完整扫描数百 MB，让用户在
+                # “正在读取”阶段等待数分钟。先验证 schema 可读；实际范围查询
+                # 使用 strict 模式，若数据页损坏仍会清缓存并完整重建重试。
+                if os.path.getsize(dst) > 64 * 1024 * 1024:
+                    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                    rows = [("ok",)]
+                else:
+                    rows = conn.execute("PRAGMA quick_check").fetchall()
             finally:
                 conn.close()
             return bool(rows) and all(str(r[0]) == "ok" for r in rows)
@@ -1451,17 +1479,34 @@ class WeChatDB:
         return last
 
     def _decrypt_file(self, src: str, dst: str, key: bytes) -> None:
-        size = os.path.getsize(src)
-        pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(src, "rb") as fin, open(dst, "wb") as fout:
-            for pgno in range(1, pages + 1):
-                page = fin.read(PAGE_SZ)
-                if not page:
-                    break
+        chunk_pages = 256
+        chunk_size = PAGE_SZ * chunk_pages
+
+        def decrypt_chunk(first_pgno: int, data: bytes) -> bytes:
+            out = bytearray()
+            for offset in range(0, len(data), PAGE_SZ):
+                page = data[offset:offset + PAGE_SZ]
                 if len(page) < PAGE_SZ:
-                    page = page + b"\x00" * (PAGE_SZ - len(page))
-                fout.write(_decrypt_page(key, page, pgno))
+                    page += b"\x00" * (PAGE_SZ - len(page))
+                out.extend(_decrypt_page(key, page, first_pgno + offset // PAGE_SZ))
+            return bytes(out)
+
+        workers = min(8, max(2, os.cpu_count() or 2))
+        pending = deque()
+        with open(src, "rb") as fin, open(dst, "wb") as fout, \
+                ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wxdb-decrypt") as pool:
+            pgno = 1
+            while True:
+                data = fin.read(chunk_size)
+                if not data:
+                    break
+                pending.append(pool.submit(decrypt_chunk, pgno, data))
+                pgno += (len(data) + PAGE_SZ - 1) // PAGE_SZ
+                if len(pending) >= workers * 2:
+                    fout.write(pending.popleft().result())
+            while pending:
+                fout.write(pending.popleft().result())
 
     def _message_dbs(self) -> List[str]:
         """返回当前所有消息分片库。微信运行中可能新建分片（如 message_5.db），
@@ -1635,7 +1680,10 @@ class WeChatDB:
     _MSG_ORDER_DESC = "ORDER BY sort_seq DESC, local_id ASC"
     _MSG_ORDER_ASC = "ORDER BY sort_seq ASC, local_id ASC"
 
-    def _shard_rows(self, tables, sql_ext, params=(), order_ext="", per_shard_limit=None):
+    def _shard_rows(
+        self, tables, sql_ext, params=(), order_ext="", per_shard_limit=None,
+        strict=False,
+    ):
         """跨分片执行统一 SELECT，返回合并后的 sqlite3.Row 列表（调用方后续排序）。
 
         tables: _run_msg_query 传入的 [(conn, table), ...]。
@@ -1664,6 +1712,8 @@ class WeChatDB:
                     params,
                 ).fetchall()
             except sqlite3.DatabaseError:
+                if strict:
+                    raise
                 continue
         return rows
 
@@ -1688,6 +1738,65 @@ class WeChatDB:
             return []
         rows.sort(key=lambda r: r["sort_seq"], reverse=True)
         return [self._msg_row_to_dict(r) for r in rows[offset:offset + limit]]
+
+    def get_messages_in_range(
+        self, user: str, start_ts: int, end_ts: int,
+        text_only: bool = False, max_rows: int = 250_001,
+    ) -> List[dict]:
+        """按时间范围一次读取会话消息，避免从最新消息反向分页扫描完整历史。
+
+        范围查询对每个命中分片直接使用 ``create_time`` 过滤，并让数据库错误
+        进入 ``_run_msg_query`` 的缓存重建重试流程，不能再静默返回空列表。
+        ``max_rows`` 会多取至多一条，方便调用方准确识别超限。
+        """
+        start_ts, end_ts = int(start_ts), int(end_ts)
+        if end_ts < start_ts:
+            raise ValueError("end_ts must be greater than or equal to start_ts")
+        cap = max(1, int(max_rows))
+        # 微信 4.x 的 sort_seq 以毫秒表示时间，并有单列索引；create_time 没有
+        # 索引。先用 sort_seq 将范围缩到目标时段，再用 create_time 做最终边界
+        # 校验，可避免对数百 MB 消息表做全表扫描。
+        where = (
+            "WHERE sort_seq >= ? AND sort_seq <= ? "
+            "AND create_time >= ? AND create_time <= ?"
+        )
+        params = [start_ts * 1000, end_ts * 1000 + 999, start_ts, end_ts]
+        if text_only:
+            # 微信 4.x 还会把真实类型编码在复合整数的低 32 位/低字节中；
+            # 必须与 _msg_type_name 的判定保持一致，否则会漏掉复合文本消息。
+            where += (
+                " AND (local_type = 1 OR (local_type > 65535 AND "
+                "((local_type & 4294967295) = 1 OR (local_type & 255) = 1)))"
+            )
+        def range_rows(tables):
+            rows = []
+            for conn, table in tables:
+                expected_index = table + "_SORTSEQ"
+                index_names = {
+                    str(item[1]) for item in conn.execute(
+                        "PRAGMA index_list(%s)" % table
+                    ).fetchall()
+                }
+                index_sql = (
+                    " INDEXED BY %s" % expected_index
+                    if expected_index in index_names else ""
+                )
+                rows += conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, "
+                    "server_id, sort_seq FROM %s%s %s "
+                    "ORDER BY sort_seq ASC, local_id ASC LIMIT %d" % (
+                        table, index_sql, where, cap,
+                    ),
+                    tuple(params),
+                ).fetchall()
+            return rows
+
+        rows = self._run_msg_query(user, range_rows)
+        if not rows:
+            return []
+        rows.sort(key=lambda r: (r["create_time"], r["sort_seq"], r["local_id"]))
+        return [self._msg_row_to_dict(r) for r in rows[:cap]]
 
     def get_message_rows_for_media(self, user: str, local_id: int) -> List[dict]:
         """返回跨分片 local_id 命中的全部消息行（供媒体分发判定类型）。
@@ -1752,9 +1861,8 @@ class WeChatDB:
         if sender_id and sender_id != 2:
             sender_index = self._sender_id_index()
             sender_username = sender_index.get(int(sender_id), "")
-            if not sender_username:
-                # fallback: 尝试从 contact.db 获取昵称
-                sender_username = self.get_nickname(str(sender_id))
+            # real_sender_id 是 message_resource 的内部数字 rowid，不是微信号。
+            # 映射缺失时不能拿数字逐条查询 contact.db（既查不到又会重复开库）。
         return {
             "local_id": row["local_id"],
             "local_type": row["local_type"],
@@ -1832,9 +1940,6 @@ class WeChatDB:
         if sender_id and sender_id != 2:
             sender_index = self._sender_id_index()
             sender_username = sender_index.get(int(sender_id), "")
-            if not sender_username:
-                # fallback: 尝试从 contact.db 获取昵称
-                sender_username = self.get_nickname(str(sender_id))
         return {
             "local_id": r["local_id"],
             "type": mtype,

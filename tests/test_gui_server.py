@@ -3,8 +3,11 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from gui.server import run_gui_server
+from gui.server import GUIStateManager, run_gui_server, state
 
 
 class TestGUIServer(unittest.TestCase):
@@ -33,10 +36,50 @@ class TestGUIServer(unittest.TestCase):
         html = urllib.request.urlopen(f"{self.base_url}/").read().decode("utf-8")
         self.assertIn("微信群聊 AI 总结助手", html)
         self.assertIn("隐私边界", html)
+        self.assertIn("立即开始总结", html)
+        self.assertNotIn("估算消息量与调用次数", html)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/style.css").status, 200)
         self.assertEqual(urllib.request.urlopen(f"{self.base_url}/app.js").status, 200)
+
+    def test_summary_starts_without_estimate_confirmation(self):
+        payload = json.dumps({
+            "group_ids": ["room@chatroom"],
+            "start": "2026-09-17T00:00",
+            "end": "2026-09-17T13:00",
+            "provider_id": "provider-id",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/api/summary/run", data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with patch.object(state, "start_summary_job", return_value="direct-job") as mocked:
+            response = json.loads(urllib.request.urlopen(request).read())
+        self.assertEqual(response["job_id"], "direct-job")
+        mocked.assert_called_once()
+
+    def test_missing_group_finishes_job_as_failed(self):
+        manager = GUIStateManager.__new__(GUIStateManager)
+        manager.reader = SimpleNamespace(connected=True)
+        manager.groups = {}
+        manager.settings = SimpleNamespace(get=lambda _key, default=None: default)
+        manager.summary_jobs = {}
+        manager._client = lambda _provider_id: object()
+
+        with patch("gui.server.threading.Thread") as thread_cls, patch("gui.server.notify"):
+            job_id = manager.start_summary_job(
+                ["missing@chatroom", "missing@chatroom"],
+                datetime(2026, 9, 17, 0, 0),
+                datetime(2026, 9, 17, 13, 0),
+                "provider-id",
+            )
+            worker = thread_cls.call_args.kwargs["target"]
+            worker()
+
+        job = manager.summary_jobs[job_id]
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["progress"], 100)
+        self.assertEqual(list(job["errors"]), ["missing@chatroom"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

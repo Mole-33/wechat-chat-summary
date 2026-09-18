@@ -24,7 +24,7 @@
     </header>
 
     <div class="privacy-banner">
-      <span>🔒</span><div><strong>隐私边界</strong><p>微信密钥仅驻留内存；消息正文和 AI 总结不自动落盘。仅聚合统计会保存。发送云端前会显示范围与调用估算。</p></div>
+      <span>🔒</span><div><strong>隐私边界</strong><p>微信密钥仅驻留内存；消息正文和 AI 总结不自动落盘。仅聚合统计会保存。开始总结后可实时查看读取与 AI 处理进度。</p></div>
     </div>
 
     <section class="setup-grid">
@@ -67,10 +67,9 @@
             <label>结束时间<input id="summaryEnd" type="datetime-local" class="form-control"></label>
             <label>AI 平台<select id="summaryProvider" class="form-control"><option value="">请先配置平台</option></select></label>
           </div>
-          <div class="action-row"><button id="btnEstimate" class="btn btn-secondary">估算消息量与调用次数</button><button id="btnRunSummary" class="btn btn-primary" disabled>确认并开始总结</button></div>
-          <div id="estimateBox" class="estimate-box hidden"></div>
+          <div class="action-row"><button id="btnRunSummary" class="btn btn-primary">立即开始总结</button></div>
           <div id="jobProgress" class="progress-box hidden"><div><span id="progressText">处理中</span><strong id="progressPercent">0%</strong></div><div class="progress-track"><i id="progressBar"></i></div></div>
-          <div id="summaryResults" class="summary-results"><div class="empty-state"><span>✨</span><p>选择时间范围并先进行费用估算</p></div></div>
+          <div id="summaryResults" class="summary-results"><div class="empty-state"><span>✨</span><p>选择时间范围和 AI 平台后直接开始总结</p></div></div>
         </article>
 
         <article class="panel glass-card">

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 APP_NAME = "微信群聊 AI 总结助手"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 GITHUB_REPOSITORY = "Mole-33/-"
 
 if getattr(sys, "frozen", False):

@@ -8,7 +8,7 @@ from core.models import ChatMessage
 from core.secure_settings import SettingsStore
 from core.stats_engine import StatsEngine
 from core.storage import StorageManager
-from core.summarizer import chunk_messages, estimate_tokens, estimate_work, summary_to_markdown
+from core.summarizer import chunk_messages, estimate_tokens, summarize_messages, summary_to_markdown
 
 
 class TestStatsAndPrivacy(unittest.TestCase):
@@ -42,11 +42,9 @@ class TestStatsAndPrivacy(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_token_estimate_and_chunks(self):
+    def test_token_counting_and_chunks(self):
         messages = self.messages()[:2]
         self.assertGreater(estimate_tokens("中文 test"), 0)
-        estimate = estimate_work(messages)
-        self.assertEqual(estimate["message_count"], 2)
         self.assertEqual(len(chunk_messages(messages, limit=20)), 2)
 
     def test_markdown_contains_fixed_sections_and_evidence(self):
@@ -60,6 +58,21 @@ class TestStatsAndPrivacy(unittest.TestCase):
         self.assertIn("## 核心摘要", md)
         self.assertIn("## 待办事项", md)
         self.assertIn("张三", md)
+
+    def test_summary_reports_ai_call_progress(self):
+        class Client:
+            def chat(self, _system, _user):
+                return {"content": '{"core_summary":"完成"}', "usage": {}}
+
+        events = []
+        messages = self.messages()[:1]
+        summarize_messages(
+            Client(), "测试群", messages[0].timestamp, messages[0].timestamp,
+            messages, lambda current, total, text: events.append((current, total, text)),
+        )
+        self.assertEqual(events[0][0], 0)
+        self.assertEqual(events[-1][0], events[-1][1])
+        self.assertIn("正在调用 AI", events[0][2])
 
     def test_api_key_is_dpapi_encrypted(self):
         settings = SettingsStore(Path(self.tmp.name) / "settings.json", Path(self.tmp.name) / "secrets.bin")
