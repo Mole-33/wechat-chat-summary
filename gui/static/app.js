@@ -7,6 +7,7 @@ const providerDefaults = {
   zhipu: ["智谱", "https://open.bigmodel.cn/api/paas/v4"],
   doubao: ["豆包", "https://ark.cn-beijing.volces.com/api/v3"],
   siliconflow: ["硅基流动", "https://api.siliconflow.cn/v1"],
+  minimax: ["MiniMax", "https://api.minimax.cn/v1"],
   custom: ["自定义兼容接口", ""]
 };
 

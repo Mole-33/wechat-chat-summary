@@ -41,6 +41,30 @@ class TestCompatibleAIClient(unittest.TestCase):
         with patch.object(client.opener, "open", return_value=_Response({"data": [{"id": "Qwen/Test"}]})):
             self.assertEqual(client.list_models(), ["Qwen/Test"])
 
+    def test_minimax_model_payload_uses_official_domestic_endpoint(self):
+        client = CompatibleAIClient({
+            "kind": "minimax", "base_url": PROVIDER_DEFAULTS["minimax"]["base_url"],
+            "api_key": "test",
+        })
+        with patch.object(client.opener, "open", return_value=_Response({"data": [{"id": "MiniMax-M3"}]})):
+            self.assertEqual(client.list_models(), ["MiniMax-M3"])
+        self.assertEqual(PROVIDER_DEFAULTS["minimax"]["base_url"], "https://api.minimax.cn/v1")
+
+    def test_minimax_m3_disables_thinking_for_direct_json_output(self):
+        client = CompatibleAIClient({
+            "kind": "minimax", "base_url": "https://api.minimax.cn/v1",
+            "api_key": "test", "model": "MiniMax-M3",
+        })
+        captured = {}
+
+        def respond(request, **_kwargs):
+            captured.update(json.loads(request.data.decode("utf-8")))
+            return _Response({"choices": [{"message": {"content": "{}"}}]})
+
+        with patch.object(client.opener, "open", side_effect=respond):
+            client.chat("system", "user")
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+
     def test_siliconflow_web_console_url_is_replaced_with_official_api(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -60,6 +84,37 @@ class TestCompatibleAIClient(unittest.TestCase):
                 "kind": "openai", "base_url": "http://127.0.0.1:9", "api_key": "secret",
             })
             self.assertEqual(profile["base_url"], PROVIDER_DEFAULTS["openai"]["base_url"])
+
+    def test_minimax_builtin_ignores_submitted_api_address(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            store = SettingsStore(root / "settings.json", root / "secrets.bin")
+            profile = store.upsert_provider({
+                "kind": "minimax", "base_url": "http://127.0.0.1:9", "api_key": "secret",
+            })
+            self.assertEqual(profile["base_url"], PROVIDER_DEFAULTS["minimax"]["base_url"])
+
+    def test_structured_provider_error_is_reported(self):
+        client = CompatibleAIClient({
+            "kind": "minimax", "base_url": "https://api.minimax.cn/v1",
+            "api_key": "test", "model": "MiniMax-M3",
+        })
+        with patch.object(client.opener, "open", return_value=_Response({
+            "base_resp": {"status_code": 1004, "status_msg": "API key 无效"},
+        })):
+            with self.assertRaisesRegex(APIClientError, "API key 无效"):
+                client.chat("system", "user")
+
+    def test_structured_model_list_error_is_reported(self):
+        client = CompatibleAIClient({
+            "kind": "minimax", "base_url": "https://api.minimax.cn/v1",
+            "api_key": "test",
+        })
+        with patch.object(client.opener, "open", return_value=_Response({
+            "base_resp": {"status_code": 1004, "status_msg": "API key 无效"},
+        })):
+            with self.assertRaisesRegex(APIClientError, "API key 无效"):
+                client.list_models()
 
     def test_proxy_address_adds_http_scheme(self):
         with tempfile.TemporaryDirectory() as folder:

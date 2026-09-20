@@ -323,9 +323,11 @@ class GUIStateManager:
         def worker():
             job = self.summary_jobs[job_id]
             job["status"] = "running"
-            if getattr(client, "profile", {}).get("kind") == "siliconflow":
+            provider_kind = getattr(client, "profile", {}).get("kind")
+            if provider_kind in {"siliconflow", "minimax"}:
+                provider_name = "MiniMax" if provider_kind == "minimax" else "硅基流动"
                 job["progress"] = 1
-                job["message"] = "正在检查硅基流动 API、Key 与网络连接"
+                job["message"] = f"正在检查 {provider_name} API、Key 与网络连接"
                 try:
                     client.list_models()
                 except Exception as exc:
@@ -335,7 +337,7 @@ class GUIStateManager:
                     job["progress"] = 100
                     job["message"] = "AI 平台连接检查失败，尚未读取微信消息"
                     job["finished_at"] = datetime.now().isoformat(timespec="seconds")
-                    notify("群聊总结失败", f"硅基流动连接检查失败：{exc}")
+                    notify("群聊总结失败", f"{provider_name} 连接检查失败：{exc}")
                     return
             completed = 0
             for group_id in group_ids:

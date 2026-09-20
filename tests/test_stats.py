@@ -8,7 +8,7 @@ from core.models import ChatMessage
 from core.secure_settings import SettingsStore
 from core.stats_engine import StatsEngine
 from core.storage import StorageManager
-from core.summarizer import chunk_messages, estimate_tokens, summarize_messages, summary_to_markdown
+from core.summarizer import _parse_json, chunk_messages, estimate_tokens, summarize_messages, summary_to_markdown
 
 
 class TestStatsAndPrivacy(unittest.TestCase):
@@ -137,6 +137,14 @@ class TestStatsAndPrivacy(unittest.TestCase):
         self.assertEqual(events[0][0], 0)
         self.assertEqual(events[-1][0], events[-1][1])
         self.assertIn("正在调用 AI", events[0][2])
+
+    def test_reasoning_block_does_not_interfere_with_summary_json(self):
+        result = _parse_json(
+            '<think>先分析一个包含 {"noise": true} 的例子</think>'
+            '{"core_summary":"正确结果","topics":[]}'
+        )
+        self.assertEqual(result["core_summary"], "正确结果")
+        self.assertEqual(result["topics"], [])
 
     def test_api_key_is_dpapi_encrypted(self):
         settings = SettingsStore(Path(self.tmp.name) / "settings.json", Path(self.tmp.name) / "secrets.bin")

@@ -63,6 +63,10 @@ def chunk_messages(messages: Iterable[ChatMessage], limit: int = CHUNK_TOKEN_LIM
 
 def _parse_json(content: str) -> Dict:
     text = content.strip()
+    # Some reasoning models place internal reasoning in <think> blocks before
+    # the requested JSON. Discard those blocks so braces inside them cannot
+    # confuse the JSON extractor.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
     if fenced:
         text = fenced.group(1)

@@ -15,6 +15,25 @@ class APIClientError(RuntimeError):
     pass
 
 
+def _error_message(payload) -> str:
+    """Extract an actionable message from common OpenAI-compatible errors."""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("msg")
+        if message:
+            return str(message)
+    elif error:
+        return str(error)
+    base_resp = payload.get("base_resp")
+    if isinstance(base_resp, dict):
+        message = base_resp.get("status_msg") or base_resp.get("message")
+        if message:
+            return str(message)
+    return str(payload.get("message") or payload.get("msg") or "")
+
+
 def _endpoint(base_url: str, suffix: str) -> str:
     base = base_url.strip().rstrip("/")
     if not base:
@@ -75,7 +94,7 @@ class CompatibleAIClient:
             detail = exc.read().decode("utf-8", errors="replace")[:800]
             try:
                 parsed = json.loads(detail)
-                detail = parsed.get("error", {}).get("message") or parsed.get("message") or detail
+                detail = _error_message(parsed) or detail
             except Exception:
                 pass
             raise APIClientError(f"平台返回 HTTP {exc.code}：{detail}") from None
@@ -108,6 +127,10 @@ class CompatibleAIClient:
             data = payload
         else:
             data = []
+        if not data:
+            error = _error_message(payload)
+            if error:
+                raise APIClientError(f"平台返回错误：{error}")
         models = sorted({
             str(item.get("id") or item.get("name"))
             for item in data
@@ -133,7 +156,14 @@ class CompatibleAIClient:
         }
         if self.profile.get("kind") == "openai":
             body["store"] = False
+        if self.profile.get("kind") == "minimax" and model.lower().startswith("minimax-m3"):
+            # M3 enables reasoning by default. A chat-summary task benefits from
+            # direct JSON output and lower latency rather than a visible chain of thought.
+            body["thinking"] = {"type": "disabled"}
         payload = self._request("POST", url, body)
+        error = _error_message(payload)
+        if error and not payload.get("choices"):
+            raise APIClientError(f"平台返回错误：{error}")
         try:
             content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):

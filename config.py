@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 APP_NAME = "微信群聊 AI 总结助手"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 GITHUB_REPOSITORY = "Mole-33/wechat-chat-summary"
 
 if getattr(sys, "frozen", False):
@@ -55,5 +55,6 @@ PROVIDER_DEFAULTS = {
     "zhipu": {"name": "智谱", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
     "doubao": {"name": "豆包", "base_url": "https://ark.cn-beijing.volces.com/api/v3"},
     "siliconflow": {"name": "硅基流动", "base_url": "https://api.siliconflow.cn/v1"},
+    "minimax": {"name": "MiniMax", "base_url": "https://api.minimax.cn/v1"},
     "custom": {"name": "自定义兼容接口", "base_url": ""},
 }
