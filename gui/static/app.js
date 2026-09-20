@@ -84,7 +84,18 @@ function renderGroups() {
     label.append(cb, name, count); box.appendChild(label);
   }); updateGroupCount(); refreshGroupSelects();
 }
-function updateGroupCount() { $("groupCount").textContent = `${state.selected.size} 个`; }
+function toggleGroupDropdown(force) {
+  if (!state.groups.length) return;
+  const panel = $("groupDropdown"), button = $("groupToggle");
+  const open = force === undefined ? panel.classList.contains("hidden") : !!force;
+  panel.classList.toggle("hidden", !open); button.setAttribute("aria-expanded", String(open));
+  if (open) { $("groupSearch").focus(); renderGroups(); }
+}
+function updateGroupCount() {
+  $("groupCount").textContent = `${state.selected.size} 个`;
+  const button = $("groupToggle"), text = $("groupToggleText"); button.disabled = !state.groups.length;
+  text.textContent = !state.groups.length ? "请先连接微信" : (state.selected.size ? `已选择 ${state.selected.size} 个群聊` : "点击选择群聊");
+}
 function selectedGroups() { return state.groups.filter(g => state.selected.has(g.id)).map(g => ({id:g.id,name:g.name})); }
 function refreshGroupSelects() {
   const select = $("statsGroup"), old = select.value; select.innerHTML = "";
@@ -92,7 +103,7 @@ function refreshGroupSelects() {
 }
 async function saveGroups() {
   const groups = selectedGroups(); if (!groups.length) return toast("请至少选择一个群聊", "error");
-  await api("/api/groups/select", {method:"POST", body:JSON.stringify({groups})}); await loadSettings(); refreshGroupSelects(); toast("群聊选择已保存", "success");
+  await api("/api/groups/select", {method:"POST", body:JSON.stringify({groups})}); await loadSettings(); refreshGroupSelects(); toggleGroupDropdown(false); toast("群聊选择已保存", "success");
 }
 
 async function toggleMonitor() {
@@ -137,7 +148,8 @@ function renderSummaryResults(job){const box=$("summaryResults");box.innerHTML="
 async function saveSchedule(){const groups=selectedGroups();const first={};if($("firstBackfill").value)groups.forEach(g=>first[g.id]=$("firstBackfill").value);try{await api("/api/settings/schedule",{method:"POST",body:JSON.stringify({enabled:$("scheduleEnabled").checked,time:$("scheduleTime").value,provider_id:$("summaryProvider").value,first_backfill:first})});toast("定时设置已保存","success");await loadSettings()}catch(e){toast(e.message,"error")}}
 
 function bind(){
-  $("btnReloadAccounts").onclick=loadAccounts;$("btnConnect").onclick=connectWechat;$("groupSearch").oninput=renderGroups;$("btnSaveGroups").onclick=saveGroups;$("btnMonitor").onclick=toggleMonitor;$("btnRefreshStats").onclick=refreshStats;$("btnRunSummary").onclick=runSummary;$("btnSaveSchedule").onclick=saveSchedule;
+  $("btnReloadAccounts").onclick=loadAccounts;$("btnConnect").onclick=connectWechat;$("groupToggle").onclick=()=>toggleGroupDropdown();$("groupSearch").oninput=renderGroups;$("btnSaveGroups").onclick=saveGroups;$("btnMonitor").onclick=toggleMonitor;$("btnRefreshStats").onclick=refreshStats;$("btnRunSummary").onclick=runSummary;$("btnSaveSchedule").onclick=saveSchedule;
+  document.addEventListener("click",e=>{if(!$("groupSelect").contains(e.target))toggleGroupDropdown(false)});document.addEventListener("keydown",e=>{if(e.key==="Escape")toggleGroupDropdown(false)});
   $("btnSettings").onclick=()=>$("settingsDialog").showModal();$("providerProfile").onchange=e=>loadProviderForm(e.target.value);$("providerKind").onchange=applyProviderDefault;$("providerModelList").onchange=e=>{if(e.target.value)$("providerModel").value=e.target.value};$("btnSaveProvider").onclick=()=>saveProvider();$("btnFetchModels").onclick=fetchModels;$("btnTestProvider").onclick=testProvider;$("btnSaveProxy").onclick=saveProxy;
   $("btnUpdate").onclick=async()=>{const btn=$("btnUpdate");btn.disabled=true;try{const check=await api("/api/update/check",{method:"POST",body:"{}"});if(!check.available)return toast(check.message,"success");if(confirm(`发现 ${check.latest_version}，是否下载已签名更新包？`)){const staged=await api("/api/update/stage",{method:"POST",body:"{}"});toast(staged.message,"success")}}catch(e){toast(e.message,"error")}finally{btn.disabled=false}};
   $("btnExcel").onclick=async()=>{try{await api("/api/report/excel",{method:"POST",body:JSON.stringify({group_id:$("statsGroup").value,date:$("statsDate").value})});toast("Excel 已生成并打开","success")}catch(e){toast(e.message,"error")}};$("btnReports").onclick=()=>api("/api/report/open-folder",{method:"POST",body:"{}"}).catch(e=>toast(e.message,"error"));$("btnExit").onclick=async()=>{await api("/api/shutdown",{method:"POST",body:"{}"});window.close()};

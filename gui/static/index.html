@@ -38,8 +38,15 @@
 
       <article class="panel glass-card">
         <div class="panel-header"><h2>② 选择群聊</h2><span id="groupCount" class="badge badge-cyan">0 个</span></div>
-        <input id="groupSearch" class="form-control" placeholder="搜索群名称">
-        <div id="groupPicker" class="group-picker"><div class="empty-state compact">连接微信后显示群聊</div></div>
+        <div id="groupSelect" class="group-select">
+          <button id="groupToggle" type="button" class="group-toggle" aria-expanded="false" disabled>
+            <span id="groupToggleText">请先连接微信</span><span class="group-chevron">⌄</span>
+          </button>
+          <div id="groupDropdown" class="group-dropdown hidden">
+            <input id="groupSearch" class="form-control" placeholder="搜索群名称" autocomplete="off">
+            <div id="groupPicker" class="group-picker"><div class="empty-state compact">连接微信后显示群聊</div></div>
+          </div>
+        </div>
         <button id="btnSaveGroups" class="btn btn-secondary btn-block">保存群聊选择</button>
       </article>
 
