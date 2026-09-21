@@ -19,7 +19,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败" }
 
     $Target = Join-Path $ProjectRoot "dist\$Name"
-    Copy-Item -LiteralPath "README.md","LICENSE","THIRD_PARTY_NOTICES.md" -Destination $Target -Force
+    Copy-Item -LiteralPath "README.md","Changelog.txt","LICENSE","THIRD_PARTY_NOTICES.md" -Destination $Target -Force
     Copy-Item -LiteralPath "vendor\LICENSE.wechatauto-replica" -Destination $Target -Force
     foreach ($PrivateName in @("data", "reports", "exports", ".secrets")) {
         $PrivatePath = Join-Path $Target $PrivateName
