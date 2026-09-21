@@ -324,6 +324,69 @@ class RangeQueryTests(unittest.TestCase):
                 conn.close()
         self.assertEqual([row["content"] for row in rows], ["earlier", "later"])
 
+    def test_new_message_pagination_does_not_drop_cross_shard_rows(self):
+        conns = []
+        for shard_index in range(2):
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            table = f"Msg_{shard_index}"
+            conn.execute(
+                f"CREATE TABLE {table}(local_id INT, local_type INT, real_sender_id INT, "
+                "create_time INT, message_content TEXT, source BLOB, packed_info_data BLOB, "
+                "compress_content BLOB, server_id INT, sort_seq INT)"
+            )
+            conn.execute(f"CREATE INDEX {table}_SORTSEQ ON {table}(sort_seq)")
+            values = []
+            for local_id in range(1, 351):
+                sort_seq = local_id * 2 + shard_index
+                values.append((
+                    local_id, 1, 2, sort_seq, f"{shard_index}-{local_id}",
+                    None, None, None, sort_seq, sort_seq,
+                ))
+            conn.executemany(f"INSERT INTO {table} VALUES(?,?,?,?,?,?,?,?,?,?)", values)
+            conns.append((conn, table))
+        db = WeChatDB.__new__(WeChatDB)
+        db._run_msg_query = lambda _user, build: build(conns)
+        try:
+            first = db.get_new_messages("room", since_seq=0, limit=500, offset=0)
+            second = db.get_new_messages("room", since_seq=0, limit=500, offset=500)
+        finally:
+            for conn, _table in conns:
+                conn.close()
+        combined = first + second
+        self.assertEqual(len(first), 500)
+        self.assertEqual(len(second), 200)
+        self.assertEqual(len({row["content"] for row in combined}), 700)
+        self.assertEqual(
+            [row["sort_seq"] for row in combined],
+            sorted(row["sort_seq"] for row in combined),
+        )
+
+    def test_reader_drains_all_live_pages_before_advancing_watermark(self):
+        class FakeDB:
+            def __init__(self):
+                self.calls = []
+
+            def get_new_messages(self, _group_id, since_seq, limit, offset):
+                self.calls.append((since_seq, limit, offset))
+                end = min(offset + limit, 601)
+                return [
+                    {
+                        "local_id": index, "sort_seq": index, "type": "文本",
+                        "sender_id": "wxid_sender", "sender_username": "wxid_sender",
+                        "create_time": 1789689600 + index, "content": str(index),
+                    }
+                    for index in range(offset + 1, end + 1)
+                ]
+
+        reader = WeChat4Reader()
+        reader.db = FakeDB()
+        reader._members = lambda _group_id: {"wxid_sender": "发送者"}
+        result = reader.read_new("room", "群", 0)
+        self.assertEqual(len(result["messages"]), 601)
+        self.assertEqual(result["latest_seq"], 601)
+        self.assertEqual(reader.db.calls, [(0, 500, 0), (0, 500, 500)])
+
     def test_group_message_prefix_overrides_wrong_numeric_sender_mapping(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

@@ -439,7 +439,20 @@ class WeChat4Reader:
         return int(rows[0].get("sort_seq") or 0) if rows else 0
 
     def read_new(self, group_id: str, group_name: str, since_seq: int) -> dict:
-        rows = self._require_db().get_new_messages(group_id, since_seq=since_seq, limit=500)
+        db = self._require_db()
+        page_size = 500
+        rows = []
+        offset = 0
+        # 同一轮使用固定 since_seq 并排空全部分页后才推进水位。否则当两次轮询
+        # 之间累积超过 500 条（尤其边界上 sort_seq 相同）时，后页会永久漏读。
+        while True:
+            page = db.get_new_messages(
+                group_id, since_seq=since_seq, limit=page_size, offset=offset,
+            )
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
         members = self._members(group_id) if rows else {}
         converted = [
             self._convert(group_id, group_name, row, members)

@@ -90,6 +90,8 @@ class GUIStateManager:
         self.groups: Dict[str, Dict[str, Any]] = {}
         self.live_messages: List[Dict[str, Any]] = []
         self.monitor_watermarks: Dict[str, int] = {}
+        self.monitor_failures: Dict[str, int] = {}
+        self.monitor_error = ""
         self.is_monitoring = False
         self.should_exit = False
         self.startup_state = "idle"
@@ -101,6 +103,8 @@ class GUIStateManager:
         self._lock = threading.RLock()
         self._db_lock = threading.RLock()
         self.summary_jobs: Dict[str, Dict[str, Any]] = {}
+        self._summary_job_lock = threading.RLock()
+        self._current_summary_job_id = ""
         self.updater = UpdateManager()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
@@ -114,12 +118,54 @@ class GUIStateManager:
             "connected": self.reader.connected,
             "account": self.account_info,
             "is_monitoring": self.is_monitoring,
+            "monitor_error": self.monitor_error,
             "startup_state": self.startup_state,
             "startup_message": self.startup_message,
             "selected_groups": selected,
             "live_message_count": len(self.live_messages),
             "schedule_enabled": bool(self.settings.get("schedule_enabled", False)),
+            "active_summary_job_id": self.active_summary_job_id(),
+            "latest_summary_job_id": self.latest_summary_job_id(),
         }
+
+    def _ensure_summary_job_state(self) -> None:
+        if not hasattr(self, "summary_jobs"):
+            self.summary_jobs = {}
+        if not hasattr(self, "_summary_job_lock"):
+            self._summary_job_lock = threading.RLock()
+        if not hasattr(self, "_current_summary_job_id"):
+            self._current_summary_job_id = ""
+
+    def active_summary_job_id(self) -> str:
+        self._ensure_summary_job_state()
+        with self._summary_job_lock:
+            job = self.summary_jobs.get(self._current_summary_job_id)
+            if job and job.get("status") in {"queued", "running"}:
+                return self._current_summary_job_id
+            self._current_summary_job_id = ""
+            return ""
+
+    def latest_summary_job_id(self) -> str:
+        self._ensure_summary_job_state()
+        with self._summary_job_lock:
+            if not self.summary_jobs:
+                return ""
+            return max(
+                self.summary_jobs,
+                key=lambda job_id: self.summary_jobs[job_id].get("created_at") or "",
+            )
+
+    def _prune_summary_jobs(self, keep: int = 20) -> None:
+        finished = sorted(
+            (
+                job_id for job_id, job in self.summary_jobs.items()
+                if job.get("status") not in {"queued", "running"}
+            ),
+            key=lambda job_id: self.summary_jobs[job_id].get("finished_at")
+            or self.summary_jobs[job_id].get("created_at") or "",
+        )
+        while len(self.summary_jobs) >= keep and finished:
+            self.summary_jobs.pop(finished.pop(0), None)
 
     def restore_saved_session_async(self) -> bool:
         """Reconnect the saved account and resume live reads once per launch."""
@@ -203,6 +249,22 @@ class GUIStateManager:
             group_id = str(item.get("id") or "")
             if group_id in self.groups:
                 clean.append({"id": group_id, "name": self.groups[group_id]["name"]})
+        # 实时读取期间新增群聊时，从它的当前末尾开始监听，不能用默认水位 0
+        # 把整个历史记录误当成实时消息。先准备水位，再发布新的群聊选择，避免
+        # 轮询线程在两步之间看见尚未初始化的新群。
+        if self.is_monitoring:
+            selected_ids = {item["id"] for item in clean}
+            with self._lock:
+                watermarks = {
+                    group_id: seq for group_id, seq in self.monitor_watermarks.items()
+                    if group_id in selected_ids
+                }
+            with self._db_lock:
+                for item in clean:
+                    if item["id"] not in watermarks:
+                        watermarks[item["id"]] = self.reader.latest_sequence(item["id"])
+            with self._lock:
+                self.monitor_watermarks = watermarks
         self.settings.set("selected_groups", clean)
 
     def _group(self, group_id: str) -> Dict[str, Any]:
@@ -220,51 +282,99 @@ class GUIStateManager:
         selected = self.settings.get("selected_groups", [])
         if not selected:
             raise ValueError("请至少选择一个群聊")
-        with self._lock:
-            if self.is_monitoring:
-                return {"success": True, "message": "实时读取已在运行"}
-            self.monitor_watermarks = {}
-            with self._db_lock:
-                for group in selected:
-                    self.monitor_watermarks[group["id"]] = self.reader.latest_sequence(group["id"])
-            self._stop_monitor.clear()
-            self.is_monitoring = True
-            self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self._monitor_thread.start()
+        # 所有需要同时碰数据库锁与状态锁的路径统一按 db -> state 顺序，
+        # 避免保存群聊和启动监听并发时互相等待。
+        with self._db_lock:
+            with self._lock:
+                if self.is_monitoring:
+                    return {"success": True, "message": "实时读取已在运行"}
+            watermarks = {
+                group["id"]: self.reader.latest_sequence(group["id"])
+                for group in selected
+            }
+            with self._lock:
+                # 另一个并发请求可能已在数据库扫描期间启动了监听。
+                if self.is_monitoring:
+                    return {"success": True, "message": "实时读取已在运行"}
+                self.monitor_watermarks = watermarks
+                self.monitor_failures = {}
+                self.monitor_error = ""
+                # 每个轮询线程使用独立停止事件。旧线程即使正在慢查询，也不会因为
+                # 新一轮 clear() 而被意外复活并与新线程重复读取。
+                stop_event = threading.Event()
+                self._stop_monitor = stop_event
+                self.is_monitoring = True
+                self._monitor_thread = threading.Thread(
+                    target=self._monitor_loop, args=(stop_event,), daemon=True,
+                )
+                self._monitor_thread.start()
         return {"success": True, "message": f"已开始读取 {len(selected)} 个群的新文字消息"}
 
     def stop_monitoring(self) -> Dict[str, Any]:
-        self._stop_monitor.set()
-        self.is_monitoring = False
+        with self._lock:
+            self._stop_monitor.set()
+            self.is_monitoring = False
         return {"success": True, "message": "实时读取已停止"}
 
-    def _monitor_loop(self) -> None:
+    def _monitor_loop(self, stop_event: Optional[threading.Event] = None) -> None:
+        event = stop_event or self._stop_monitor
+        current_thread = threading.current_thread()
         try:
-            while not self._stop_monitor.wait(float(DEFAULT_CONFIG["poll_interval_seconds"])):
+            while not event.wait(float(DEFAULT_CONFIG["poll_interval_seconds"])):
                 selected = list(self.settings.get("selected_groups", []))
                 for group in selected:
+                    if event.is_set():
+                        break
                     group_id, name = group["id"], group["name"]
-                    since = self.monitor_watermarks.get(group_id, 0)
+                    with self._lock:
+                        # 群聊可能刚在运行中被取消；不要再写入它的消息。
+                        if group_id not in self.monitor_watermarks:
+                            continue
+                        since = self.monitor_watermarks[group_id]
                     try:
                         with self._db_lock:
                             batch = self.reader.read_new(group_id, name, since)
-                        self.monitor_watermarks[group_id] = int(batch["latest_seq"])
+                        with self._lock:
+                            if event.is_set() or group_id not in self.monitor_watermarks:
+                                continue
+                            self.monitor_failures.pop(group_id, None)
+                            if not self.monitor_failures:
+                                self.monitor_error = ""
+                            self.monitor_watermarks[group_id] = int(batch["latest_seq"])
                         if not batch["messages"]:
                             continue
                         with self._lock:
                             for message in batch["messages"]:
-                                self.live_messages.insert(0, {
+                                self.live_messages.append({
                                     "time": message.timestamp.strftime("%H:%M:%S"),
+                                    "timestamp": message.timestamp.isoformat(timespec="seconds"),
                                     "sender": message.sender_nickname,
                                     "content": message.content,
                                     "group": name,
                                     "is_self": message.sender_id == self.account_info.get("wxid"),
                                 })
-                            del self.live_messages[100:]
-                    except Exception:
+                            # 多个群按顺序读取，但看板必须按真实消息时间全局排序，
+                            # 不能让“后读取的群”整批盖到较新的消息上面。
+                            self.live_messages.sort(
+                                key=lambda item: item.get("timestamp", ""), reverse=True,
+                            )
+                            del self.live_messages[500:]
+                    except Exception as exc:
+                        with self._lock:
+                            failures = self.monitor_failures.get(group_id, 0) + 1
+                            self.monitor_failures[group_id] = failures
+                        if failures in {1, 3}:
+                            LOGGER.warning("实时读取【%s】连续失败 %s 次：%s", name, failures, exc)
+                        if failures >= 3:
+                            with self._lock:
+                                self.monitor_error = f"【{name}】连续读取失败：{exc}"
                         continue
         finally:
-            self.is_monitoring = False
+            with self._lock:
+                # 退出的旧线程不能把后来新线程的运行状态改成“已停止”。
+                if self._monitor_thread is current_thread:
+                    self.is_monitoring = False
+                    self._monitor_thread = None
 
     def refresh_stats(self, group_id: str, day: str) -> Dict[str, Any]:
         group = self._group(group_id)
@@ -311,16 +421,24 @@ class GUIStateManager:
             raise ValueError("请至少选择一个群聊")
         if not self.reader.connected:
             raise RuntimeError("请先连接微信账号")
+        self._ensure_summary_job_state()
+        if self.active_summary_job_id():
+            raise ValueError("已有总结任务正在运行，请等待当前任务完成")
         client = self._client(provider_id, require_model=True)
         job_id = uuid.uuid4().hex
-        self.summary_jobs[job_id] = {
-            "id": job_id, "status": "queued", "progress": 0,
-            "message": "任务已创建，准备读取聊天记录", "results": {}, "errors": {},
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "automatic": automatic,
-        }
+        with self._summary_job_lock:
+            if self.active_summary_job_id():
+                raise ValueError("已有总结任务正在运行，请等待当前任务完成")
+            self._prune_summary_jobs()
+            self.summary_jobs[job_id] = {
+                "id": job_id, "status": "queued", "progress": 0,
+                "message": "任务已创建，准备读取聊天记录", "results": {}, "errors": {},
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "automatic": automatic,
+            }
+            self._current_summary_job_id = job_id
 
-        def worker():
+        def worker_body():
             job = self.summary_jobs[job_id]
             job["status"] = "running"
             provider_kind = getattr(client, "profile", {}).get("kind")
@@ -389,6 +507,22 @@ class GUIStateManager:
                 f"成功 {len(job['results'])} 个群，失败 {len(job['errors'])} 个群",
             )
 
+        def worker():
+            try:
+                worker_body()
+            except Exception as exc:
+                LOGGER.exception("总结任务意外失败：%s", job_id)
+                job = self.summary_jobs[job_id]
+                job["errors"]["_global"] = str(exc)
+                job["status"] = "failed"
+                job["progress"] = 100
+                job["message"] = "总结任务意外失败"
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            finally:
+                with self._summary_job_lock:
+                    if self._current_summary_job_id == job_id:
+                        self._current_summary_job_id = ""
+
         threading.Thread(target=worker, daemon=True).start()
         return job_id
 
@@ -422,8 +556,25 @@ class GUIStateManager:
         if not runnable or not provider_id:
             return
         self.storage.set_meta("schedule_last_fired_day", now.strftime("%Y-%m-%d"))
-        for group_id, start in runnable:
-            self.start_summary_job([group_id], start, now, provider_id, automatic=True)
+        def dispatch_scheduled_jobs():
+            for group_id, start in runnable:
+                if self.should_exit:
+                    return
+                while self.active_summary_job_id() and not self.should_exit:
+                    time.sleep(1)
+                if self.should_exit:
+                    return
+                try:
+                    job_id = self.start_summary_job([group_id], start, now, provider_id, automatic=True)
+                except Exception as exc:
+                    LOGGER.exception("定时总结启动失败：%s", exc)
+                    continue
+                while self.summary_jobs.get(job_id, {}).get("status") in {"queued", "running"}:
+                    if self.should_exit:
+                        return
+                    time.sleep(1)
+
+        threading.Thread(target=dispatch_scheduled_jobs, daemon=True).start()
 
     def cleanup(self) -> None:
         self.should_exit = True
@@ -431,14 +582,16 @@ class GUIStateManager:
         self.disconnect()
         with self._lock:
             self.live_messages.clear()
+        with self._summary_job_lock:
             self.summary_jobs.clear()
+            self._current_summary_job_id = ""
 
 
 state = GUIStateManager()
 
 
 class AppHTTPRequestHandler(BaseHTTPRequestHandler):
-    server_version = "WeChatAISummary/0.1"
+    server_version = f"WeChatAISummary/{APP_VERSION}"
 
     def log_message(self, format, *args):
         return
@@ -481,7 +634,7 @@ class AppHTTPRequestHandler(BaseHTTPRequestHandler):
                 return self._json(state.settings.public_settings())
             if path == "/api/messages/live":
                 with state._lock:
-                    return self._json({"messages": state.live_messages[:50]})
+                    return self._json({"messages": state.live_messages[:200]})
             if path == "/api/stats/today":
                 group_id = query.get("group_id", [""])[0]
                 day = query.get("date", [date.today().isoformat()])[0]

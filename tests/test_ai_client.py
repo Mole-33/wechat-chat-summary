@@ -1,5 +1,6 @@
 import io
 import json
+import socket
 import tempfile
 import unittest
 import urllib.error
@@ -114,6 +115,22 @@ class TestCompatibleAIClient(unittest.TestCase):
             "base_resp": {"status_code": 1004, "status_msg": "API key 无效"},
         })):
             with self.assertRaisesRegex(APIClientError, "API key 无效"):
+                client.list_models()
+
+    def test_model_list_retries_transient_http_error(self):
+        client = CompatibleAIClient({"base_url": "https://api.example/v1", "api_key": "test"})
+        error = urllib.error.HTTPError(
+            "https://api.example/v1/models", 503, "busy", Message(), io.BytesIO(b"busy"),
+        )
+        with patch.object(client.opener, "open", side_effect=[error, _Response({"data": [{"id": "model-a"}]})]) as opened, patch("core.ai_client.time.sleep"):
+            self.assertEqual(client.list_models(), ["model-a"])
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(opened.call_args.kwargs["timeout"], 30)
+
+    def test_timeout_error_is_actionable(self):
+        client = CompatibleAIClient({"base_url": "https://api.example/v1", "api_key": "test"})
+        with patch.object(client.opener, "open", side_effect=socket.timeout("timed out")), patch("core.ai_client.time.sleep"):
+            with self.assertRaisesRegex(APIClientError, "30 秒内没有响应"):
                 client.list_models()
 
     def test_proxy_address_adds_http_scheme(self):

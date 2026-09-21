@@ -1997,26 +1997,33 @@ class WeChatDB:
         rows.sort(key=lambda r: r["sort_seq"], reverse=True)
         return [r["local_id"] for r in rows]
 
-    def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> List[dict]:
+    def get_new_messages(
+        self, user: str, since_seq: int = 0, limit: int = 200, offset: int = 0,
+    ) -> List[dict]:
         """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用
 
-        优化：分片内先 ORDER BY+LIMIT 再合并取前 limit 条。排序键同
+        offset 用于一次轮询内继续排空超过 limit 的消息，避免高峰期只读取
+        第一页后便推进水位而永久漏掉后续消息。分片内先 ORDER BY+LIMIT
+        再合并取目标窗口。排序键同
         get_messages：分片内 local_id 升序固定 tie-break，跨分片保持
         稳定合并（先分片顺序），与旧实现逐条一致。
         """
         want = max(0, int(limit))
+        skip = max(0, int(offset))
+        cap = want + skip
         rows = self._run_msg_query(
             user,
             lambda tables: self._shard_rows(
                 tables, "WHERE sort_seq > ?",
                 (since_seq,),
-                order_ext=self._MSG_ORDER_ASC, per_shard_limit=want,
+                order_ext=self._MSG_ORDER_ASC, per_shard_limit=cap,
+                strict=True,
             ),
         )
         if not rows:
             return []
         rows.sort(key=lambda r: r["sort_seq"])
-        return self._msg_rows_to_dicts(rows[:want], user)
+        return self._msg_rows_to_dicts(rows[skip:cap], user)
 
     def _msg_rows_to_dicts(self, rows, user: str = "") -> List[dict]:
         """Convert rows and learn a sender map scoped to one group.

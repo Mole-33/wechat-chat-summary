@@ -22,6 +22,22 @@ from config import APP_NAME, APP_VERSION, LOGS_DIR
 LOGGER = logging.getLogger("wechat_ai_summary")
 PORT_START = 18989
 PORT_END = 19038
+_NULL_STREAMS = []
+
+
+def ensure_standard_streams() -> None:
+    """Give windowed PyInstaller builds writable stdout/stderr placeholders.
+
+    ``--windowed`` intentionally sets these streams to ``None``.  Database
+    recovery code may still emit diagnostics while rebuilding a live WAL;
+    without a placeholder that diagnostic can mask the recoverable SQLite
+    error with ``NoneType has no attribute write`` and stop real-time reads.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            stream = open(os.devnull, "w", encoding="utf-8")
+            _NULL_STREAMS.append(stream)
+            setattr(sys, name, stream)
 
 
 def configure_logging() -> Path:
@@ -144,6 +160,7 @@ def run() -> None:
 def main() -> None:
     log_path = None
     try:
+        ensure_standard_streams()
         log_path = configure_logging()
         run()
     except Exception as exc:
