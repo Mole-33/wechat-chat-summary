@@ -36,14 +36,14 @@
         <p class="form-help">微信需保持登录。首次连接可能请求管理员权限；解密工作副本在退出时清除。</p>
       </article>
 
-      <article class="panel glass-card">
+      <article id="groupPanel" class="panel glass-card">
         <div class="panel-header"><h2>② 选择群聊</h2><span id="groupCount" class="badge badge-cyan">0 个</span></div>
         <div id="groupSelect" class="group-select">
-          <button id="groupToggle" type="button" class="group-toggle" aria-expanded="false" disabled>
+          <button id="groupToggle" type="button" class="group-toggle" aria-expanded="false" aria-controls="groupDropdown" disabled>
             <span id="groupToggleText">请先连接微信</span><span class="group-chevron">⌄</span>
           </button>
-          <div id="groupDropdown" class="group-dropdown hidden">
-            <input id="groupSearch" class="form-control" placeholder="搜索群名称" autocomplete="off">
+          <div id="groupDropdown" class="group-dropdown hidden" role="dialog" aria-label="选择群聊">
+            <input id="groupSearch" class="form-control" placeholder="搜索群名称" aria-label="搜索群名称" autocomplete="off">
             <div id="groupPicker" class="group-picker"><div class="empty-state compact">连接微信后显示群聊</div></div>
           </div>
         </div>

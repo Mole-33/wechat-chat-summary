@@ -2208,20 +2208,20 @@ class WeChatDB:
         return results
 
     def get_nickname(self, user: str) -> str:
-        """通过微信号查昵称（用于显示）"""
+        """通过微信号查微信昵称（群聊展示不使用本机通讯录备注）"""
         for rel, path, _ in self._db_files:
             if os.path.basename(path) != "contact.db":
                 continue
             conn = self._open(rel)
             try:
                 row = conn.execute(
-                    "SELECT nick_name, remark FROM contact WHERE username=? LIMIT 1",
+                    "SELECT nick_name FROM contact WHERE username=? LIMIT 1",
                     (user,),
                 ).fetchone()
             finally:
                 conn.close()
             if row:
-                return row["remark"] or row["nick_name"] or user
+                return str(row["nick_name"] or "").strip() or user
             break
         return user
 

@@ -90,12 +90,22 @@ function renderGroups() {
     label.append(cb, name, count); box.appendChild(label);
   }); updateGroupCount(); refreshGroupSelects();
 }
+function positionGroupDropdown() {
+  const select = $("groupSelect"), panel = $("groupDropdown"), button = $("groupToggle");
+  if (panel.classList.contains("hidden")) return;
+  select.classList.remove("drop-up"); panel.style.removeProperty("--group-picker-height");
+  const rect = button.getBoundingClientRect(), below = Math.max(0, innerHeight - rect.bottom - 12), above = Math.max(0, rect.top - 12);
+  const dropUp = below < 260 && above > below, available = dropUp ? above : below;
+  select.classList.toggle("drop-up", dropUp);
+  panel.style.setProperty("--group-picker-height", `${Math.max(96, Math.min(210, available - 68))}px`);
+}
 function toggleGroupDropdown(force) {
-  if (!state.groups.length) return;
-  const panel = $("groupDropdown"), button = $("groupToggle");
+  if (!state.groups.length && force !== false) return;
+  const panel = $("groupDropdown"), button = $("groupToggle"), card = $("groupPanel"), select = $("groupSelect");
   const open = force === undefined ? panel.classList.contains("hidden") : !!force;
-  panel.classList.toggle("hidden", !open); button.setAttribute("aria-expanded", String(open));
-  if (open) { $("groupSearch").focus(); renderGroups(); }
+  panel.classList.toggle("hidden", !open); card.classList.toggle("group-menu-open", open); button.setAttribute("aria-expanded", String(open));
+  if (open) { renderGroups(); positionGroupDropdown(); $("groupSearch").focus(); }
+  else { select.classList.remove("drop-up"); panel.style.removeProperty("--group-picker-height"); }
 }
 function updateGroupCount() {
   $("groupCount").textContent = `${state.selected.size} 个`;
@@ -156,7 +166,9 @@ async function saveSchedule(){const groups=selectedGroups();const first={};if($(
 
 function bind(){
   $("btnReloadAccounts").onclick=loadAccounts;$("btnConnect").onclick=connectWechat;$("groupToggle").onclick=()=>toggleGroupDropdown();$("groupSearch").oninput=renderGroups;$("btnSaveGroups").onclick=saveGroups;$("btnMonitor").onclick=toggleMonitor;$("btnRefreshStats").onclick=refreshStats;$("btnRunSummary").onclick=runSummary;$("btnSaveSchedule").onclick=saveSchedule;
-  document.addEventListener("click",e=>{if(!$("groupSelect").contains(e.target))toggleGroupDropdown(false)});document.addEventListener("keydown",e=>{if(e.key==="Escape")toggleGroupDropdown(false)});
+  document.addEventListener("click",event=>{if(!$("groupSelect").contains(event.target))toggleGroupDropdown(false)});
+  document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!$("groupDropdown").classList.contains("hidden")){toggleGroupDropdown(false);$("groupToggle").focus()}});
+  window.addEventListener("resize",positionGroupDropdown);window.addEventListener("scroll",positionGroupDropdown,{passive:true});
   $("btnSettings").onclick=()=>$("settingsDialog").showModal();$("providerProfile").onchange=e=>loadProviderForm(e.target.value);$("providerKind").onchange=applyProviderDefault;$("providerModelList").onchange=e=>{if(e.target.value)$("providerModel").value=e.target.value};$("btnSaveProvider").onclick=()=>saveProvider();$("btnFetchModels").onclick=fetchModels;$("btnTestProvider").onclick=testProvider;$("btnSaveProxy").onclick=saveProxy;
   $("btnUpdate").onclick=async()=>{const btn=$("btnUpdate");btn.disabled=true;try{const check=await api("/api/update/check",{method:"POST",body:"{}"});if(!check.available)return toast(check.message,"success");if(confirm(`发现 ${check.latest_version}，是否下载已签名更新包？`)){const staged=await api("/api/update/stage",{method:"POST",body:"{}"});toast(staged.message,"success")}}catch(e){toast(e.message,"error")}finally{btn.disabled=false}};
   $("btnExcel").onclick=async()=>{try{await api("/api/report/excel",{method:"POST",body:JSON.stringify({group_id:$("statsGroup").value,date:$("statsDate").value})});toast("Excel 已生成并打开","success")}catch(e){toast(e.message,"error")}};$("btnReports").onclick=()=>api("/api/report/open-folder",{method:"POST",body:"{}"}).catch(e=>toast(e.message,"error"));$("btnExit").onclick=async()=>{await api("/api/shutdown",{method:"POST",body:"{}"});window.close()};

@@ -191,6 +191,32 @@ class RangeQueryTests(unittest.TestCase):
         self.assertEqual(info["username"], "wxid_internal")
         self.assertEqual(info["nick_name"], "账号昵称")
 
+    def test_group_fallback_nickname_ignores_contact_remark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "contact.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE contact(username TEXT, nick_name TEXT, remark TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO contact VALUES('wxid_alice', '微信 Alice', '本机备注 Alice')"
+            )
+            conn.commit()
+            conn.close()
+
+            db = WeChatDB.__new__(WeChatDB)
+            db._db_files = [("contact.db", path, os.path.getsize(path))]
+
+            def open_db(_rel):
+                current = sqlite3.connect(path)
+                current.row_factory = sqlite3.Row
+                return current
+
+            db._open = open_db
+            nickname = db.get_nickname("wxid_alice")
+
+        self.assertEqual(nickname, "微信 Alice")
+
     def test_reader_prefers_group_name_for_members_and_self(self):
         class FakeDB:
             wxid = "wxid_self"
@@ -209,6 +235,10 @@ class RangeQueryTests(unittest.TestCase):
                         "username": "wxid_self", "display_name": "群内的我",
                         "remark": "", "nick_name": "账号昵称",
                     },
+                    {
+                        "username": "wxid_bob", "display_name": "   ",
+                        "remark": "本机备注 Bob", "nick_name": "微信 Bob",
+                    },
                 ]
 
             def get_self_info(self):
@@ -224,14 +254,61 @@ class RangeQueryTests(unittest.TestCase):
             "local_id": 2, "sort_seq": 2, "type": "文本", "sender_id": 2,
             "sender_username": "", "create_time": 1789574401, "content": "测试",
         })
+        no_group_name = reader._convert("room", "群", {
+            "local_id": 3, "sort_seq": 3, "type": "文本", "sender_id": 8,
+            "sender_username": "wxid_bob", "create_time": 1789574402, "content": "测试",
+        })
         self.assertEqual(incoming.sender_nickname, "群内 Alice")
         self.assertEqual(outgoing.sender_nickname, "群内的我")
+        self.assertEqual(no_group_name.sender_nickname, "微信 Bob")
         self.assertEqual(reader.db.member_reads, 1)
 
         with patch("listeners.wechat4_reader.time.monotonic", return_value=10_000):
             reader._member_cache_time["room"] = 0
             reader._members("room")
         self.assertEqual(reader.db.member_reads, 2)
+
+    def test_self_fallback_uses_wechat_nickname_not_contact_remark(self):
+        class FakeDB:
+            wxid = "wxid_self"
+
+            def get_group_members(self, _group_id):
+                return []
+
+            def get_self_info(self):
+                return {
+                    "username": "wxid_self", "remark": "本机备注名",
+                    "nick_name": "微信昵称",
+                }
+
+        reader = WeChat4Reader()
+        reader.db = FakeDB()
+        message = reader._convert("room", "群", {
+            "local_id": 1, "sort_seq": 1, "type": "文本", "sender_id": 3,
+            "sender_username": "", "create_time": 1789574400, "content": "测试",
+        })
+        self.assertEqual(message.sender_nickname, "微信昵称")
+
+    def test_connected_account_header_does_not_use_contact_remark(self):
+        class FakeDB:
+            wxid = "wxid_self"
+            _keys = {"contact.db": b"key"}
+            master_key = b"master"
+            unkeyed = []
+
+            def get_self_info(self):
+                return {
+                    "username": "wxid_self", "nick_name": "",
+                    "remark": "本机备注名",
+                }
+
+        reader = WeChat4Reader()
+        with patch("listeners.wechat4_reader.EphemeralWeChatDB", return_value=FakeDB()):
+            info = reader.connect("account-a")
+        try:
+            self.assertEqual(info["nickname"], "wxid_self")
+        finally:
+            reader.close()
 
     def test_ephemeral_key_loading_rejects_a_different_running_account(self):
         db = EphemeralWeChatDB.__new__(EphemeralWeChatDB)

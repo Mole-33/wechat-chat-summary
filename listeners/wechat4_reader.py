@@ -299,7 +299,7 @@ class WeChat4Reader:
                 return {
                     "account": account,
                     "wxid": self._self_username,
-                    "nickname": info.get("nick_name") or info.get("remark") or self.db.wxid,
+                    "nickname": str(info.get("nick_name") or "").strip() or self.db.wxid,
                     "unavailable_databases": len(self.db.unkeyed),
                 }
             except Exception:
@@ -354,10 +354,9 @@ class WeChat4Reader:
                     username = str(item.get("username") or "").strip()
                     if not username:
                         continue
-                    members[username] = (
-                        item.get("display_name") or item.get("remark")
-                        or item.get("nick_name") or item.get("username") or "未知成员"
-                    )
+                    display_name = str(item.get("display_name") or "").strip()
+                    nickname = str(item.get("nick_name") or "").strip()
+                    members[username] = display_name or nickname or username
                 self._member_cache[group_id] = members
                 self._member_cache_time[group_id] = time.monotonic()
             return self._member_cache[group_id]
@@ -377,7 +376,7 @@ class WeChat4Reader:
             sender = members.get(sender_id)
             if not sender:
                 info = db.get_self_info()
-                sender = info.get("remark") or info.get("nick_name") or "我"
+                sender = str(info.get("nick_name") or "").strip() or "我"
         else:
             sender_id = row.get("sender_username") or str(row.get("sender_id") or "")
             sender = members.get(sender_id)
